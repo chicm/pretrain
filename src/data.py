@@ -13,11 +13,14 @@ from torch.utils.data import Dataset
 
 def prepare_data(dataset_name, out_dir, tokenizer, split="train",
                  text_key="text", num_proc=32, val_frac=0.0005,
-                 hf_config=None, streaming=False, max_docs=None):
-    """Tokenize a HF dataset into packed .bin files. GPT2 vocab -> uint16."""
+                 hf_config=None, streaming=False, max_docs=None, eot_id=None):
+    """Tokenize a HF dataset into packed .bin files.
+    vocab < 65536 -> uint16, else uint32 (Qwen3 vocab 151669 -> uint32)."""
     from datasets import load_dataset
     os.makedirs(out_dir, exist_ok=True)
-    eot = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    if eot_id is None:
+        eot_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    eot = eot_id
     dtype = np.uint16 if tokenizer.vocab_size < 65536 else np.uint32
 
     ds = load_dataset(dataset_name, name=hf_config, split=split, streaming=streaming)

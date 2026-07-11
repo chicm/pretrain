@@ -4,16 +4,21 @@ from model import ModelArgs
 
 
 # --- Model presets ---
-def _tiny():   # ~50M, for TinyStories smoke test on 1 GPU
-    return ModelArgs(vocab_size=50304, dim=512, n_layers=8, n_heads=8,
+# vocab_size = 151936: Qwen3 tokenizer (len=151669) padded up to a multiple of
+# 128 for GPU matmul alignment. All models share the same tokenizer/vocab so
+# tokenized data is interchangeable across model sizes.
+VOCAB_SIZE = 151936
+
+def _tiny():   # ~50M core + big embed, for TinyStories smoke test on 1 GPU
+    return ModelArgs(vocab_size=VOCAB_SIZE, dim=512, n_layers=8, n_heads=8,
                      n_kv_heads=4, ffn_hidden=1408, max_seq_len=1024)
 
-def _1b():     # ~1.1B, real pipeline validation on FineWeb-10BT
-    return ModelArgs(vocab_size=50304, dim=2048, n_layers=24, n_heads=16,
+def _1b():     # ~1.1B core, real pipeline validation on FineWeb-10BT
+    return ModelArgs(vocab_size=VOCAB_SIZE, dim=2048, n_layers=24, n_heads=16,
                      n_kv_heads=8, ffn_hidden=5632, max_seq_len=2048)
 
 def _8b():     # ~8B, production (for later, on MI300)
-    return ModelArgs(vocab_size=50304, dim=4096, n_layers=32, n_heads=32,
+    return ModelArgs(vocab_size=VOCAB_SIZE, dim=4096, n_layers=32, n_heads=32,
                      n_kv_heads=8, ffn_hidden=14336, max_seq_len=4096)
 
 MODELS = {"tiny": _tiny, "1b": _1b, "8b": _8b}
