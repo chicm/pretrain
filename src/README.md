@@ -10,11 +10,13 @@
 | `configs.py` | 模型预设（tiny/1b/8b）+ 训练超参 |
 | `data.py` | tokenize 成 packed `.bin` + memmap 数据加载 |
 | `tokenize_data.py` | 一次性预处理入口 |
-| `train.py` | FSDP2 训练循环（`fully_shard`）+ cosine LR + checkpoint |
+| `train.py` | FSDP2 训练循环（`fully_shard`）+ cosine LR + checkpoint + 观测（文本指标 + TensorBoard） |
+| `eval.py` | 用 lm-eval-harness 评测 checkpoint（loglikelihood 任务，base 模型无需指令微调） |
 | `download_data.sh` | 下载 TinyStories + FineWeb-10BT 到数据目录 |
 | `run_smoke.sh` | 单节点冒烟测试：tiny 模型 + TinyStories |
 | `run_multinode.sh` | 单节点执行脚本（多机训练，需 NODE_RANK/MASTER_ADDR） |
 | `launch_multinode.sh` | 从 node-0 分发到各节点启动多机训练 |
+| `run_eval.sh` | 单 GPU 跑 eval.py 的封装（自动装 lm-eval） |
 
 ## 路径约定
 
@@ -47,6 +49,11 @@ python tokenize_data.py --dataset HuggingFaceFW/fineweb --hf_config sample-10BT 
     --split train --out "$WORKDIR/data/fineweb_tok"
 #    再从 node-0 启动：
 bash launch_multinode.sh
+
+# 4. 评测 checkpoint（base 模型用 log-likelihood，无需指令微调）
+bash run_eval.sh "$WORKDIR/checkpoints/fineweb_1b_chimera/ckpt_2000.pt"
+#    默认任务：hellaswag,lambada_openai,arc_easy,arc_challenge
+#    加 MMLU（慢，小模型/早期约等于随机 25%）：  bash run_eval.sh <ckpt> --mmlu
 ```
 
 ## 要求
