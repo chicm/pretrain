@@ -49,7 +49,7 @@ class TrainConfig:
     log_every: int = 10
     eval_every: int = 500
     eval_batches: int = 50       # how many val batches to average per eval
-    ckpt_every: int = 200
+    ckpt_every: int = 1000
     dtype: str = "bfloat16"
     compile: bool = True
     seed: int = 1337
