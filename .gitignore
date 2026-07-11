@@ -1,0 +1,25 @@
+# --- Root-level scratch/debug scripts: ignore ALL, then un-ignore the intended ones ---
+/*.sh
+/*.py
+!/mi300_mn.sh
+!/mi300_kill.sh
+
+# temp/agent scratch files
+_*.py
+_*.txt
+_*.sh
+*.tar
+*_lf.sh
+*_lf.py
+
+# data / checkpoints
+data/
+checkpoints/
+*.bin
+*.pt
+
+# python
+__pycache__/
+*.pyc
+.venv/
+hf_home/

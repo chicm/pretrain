@@ -1,0 +1,8 @@
+# Force LF line endings for shell scripts (avoid CRLF breaking bash on Linux)
+*.sh text eol=lf
+# Python: keep LF too, safe on all platforms
+*.py text eol=lf
+# Binary data never touched
+*.bin binary
+*.pt binary
+*.tar binary
