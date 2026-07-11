@@ -173,7 +173,8 @@ def main():
             log(f"[tb] disabled ({e})")
     model.train()
     step = 0
-    skipped_steps = 0    if args.resume:
+    skipped_steps = 0
+    if args.resume:
         step = load_ckpt(model, opt, args.resume)
     t0 = time.time()
     tokens_per_step = cfg.micro_bsz * cfg.grad_accum * world * cfg.block_size
