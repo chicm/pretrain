@@ -191,6 +191,14 @@ class Chimera(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.apply(self._init)
+        # Depth-scaled init for residual output projections (GPT-2/Llama style):
+        # each residual branch's output std is divided by sqrt(2 * n_layers) so
+        # the residual-stream variance does not grow with depth. Without this,
+        # deep models (e.g. 8B/32L) diverge to NaN early in warmup.
+        residual_std = 0.02 / math.sqrt(2 * args.n_layers)
+        for layer in self.layers:
+            nn.init.normal_(layer.attn.wo.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(layer.ffn.w2.weight, mean=0.0, std=residual_std)
 
     def _init(self, m):
         if isinstance(m, nn.Linear):

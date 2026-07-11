@@ -112,6 +112,14 @@ def main():
     if args.no_compile:
         cfg.compile = False
 
+    # Per-model training-stability overrides. Larger/deeper models need a
+    # smaller peak LR and longer warmup to stay numerically stable in bf16.
+    _MODEL_OPT = {
+        "8b": dict(lr=2e-4, min_lr=2e-5, warmup_steps=500),
+    }
+    for k, v in _MODEL_OPT.get(cfg.model, {}).items():
+        setattr(cfg, k, v)
+
     local_rank = setup_dist()
     world = dist.get_world_size()
     torch.manual_seed(cfg.seed)
