@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-node 1B pretraining on FineWeb-10BT across 4 nodes x 4 A100 (=16 GPUs).
+# Multi-node 1B pretraining on FineWeb-10BT across 4 nodes x 8 MI300X (=32 GPUs).
 # This script is meant to be launched on EACH node with NODE_RANK set,
 # or via a launcher that loops nodes (see launch_multinode.sh).
 set -e
@@ -9,7 +9,7 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=WARN
 
 NNODES=${NNODES:-4}
-GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${NODE_RANK:?set NODE_RANK}
 MASTER_ADDR=${MASTER_ADDR:?set MASTER_ADDR}
 MASTER_PORT=${MASTER_PORT:-29500}

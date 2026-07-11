@@ -1,9 +1,9 @@
 """FSDP2 pretraining loop. Plain PyTorch (torch>=2.4) using torch.distributed.fsdp.fully_shard.
 
 Launch with torchrun, e.g.:
-  torchrun --nproc_per_node=4 train.py --model 1b --data_dir /path/tok
+  torchrun --nproc_per_node=8 train.py --model 1b --data_dir /path/tok
 
-Multi-node is handled by run.sh (sets MASTER_ADDR / rendezvous).
+Multi-node is handled by run_multinode.sh / launch_multinode.sh (sets MASTER_ADDR / rendezvous).
 """
 import os
 import math

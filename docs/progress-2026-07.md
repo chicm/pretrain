@@ -13,8 +13,9 @@ Hands-on progress, infrastructure, architecture decisions, and gotchas from a fr
 
 - **Goal**: pretrain a 7B–10B dense LLM from scratch.
 - **Framework**: **FSDP2** (`torch.distributed.fsdp.fully_shard`). Migrate to Megatron only for MoE / 30B+.
-- **Model**: dense decoder-only, GQA + RoPE + RMSNorm + SwiGLU. No MoE.
-- **Configs** (`src/configs.py`): `tiny` (~50M) / `1b` (1.133B) / `8b`.
+- **Model**: **Chimera** — dense decoder-only, Qwen3-style backbone (GQA + RoPE + RMSNorm + SwiGLU + **QK-Norm**), optional hybrid sliding/full attention (off for pretraining). No MoE. No soft-capping.
+- **Configs** (`src/configs.py`): `tiny` (~50M core) / `1b` (~1.444B incl. embeddings) / `8b`.
+- **Tokenizer**: **Qwen3** (`Qwen/Qwen3-8B`), vocab padded to **151936**; data packed as uint32.
 - **Data**: TinyStories (smoke) → FineWeb sample-10BT (real validation) → later FineWeb-Edu / Nemotron-CC.
 
 ---
@@ -133,7 +134,8 @@ Key points:
 - `train.py` has **no `--ckpt_every` CLI flag**: `ckpt_every` is a config attribute (`configs.py`).
   train.py unconditionally saves a checkpoint at the end; mid-run saves follow `cfg.ckpt_every`.
 - `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` is **unsupported on ROCm** (harmless warning); drop it.
-- `data.py` has a slow per-sample Python fill loop; vectorize it before tokenizing FineWeb-10BT (100B tokens).
+- `data.py` per-sample Python fill loop has been **vectorized** (memmap + batched `np.concatenate`)
+  to handle FineWeb-10BT (~10B tokens) efficiently.
 
 ### git / permissions
 - **Dubious ownership**: git refuses to operate on a repo owned by another user → add `safe.directory`.
@@ -158,6 +160,9 @@ Key points:
 
 ## 7. Next Steps
 
-1. GPU utilization monitoring (`rocm-smi` across all GPUs; confirm no straggler).
-2. Tokenize FineWeb sample-10BT (after vectorizing the `data.py` fill loop) → real-data long run.
-3. Try an 8B model multi-node (192 GB/GPU leaves ample headroom).
+1. ✅ GPU utilization monitoring (`rocm-smi` across all GPUs; `_gpumon.sh`).
+2. ✅ Tokenize FineWeb sample-10BT (~10.2B tokens, uint32, Qwen3) → real-data run launched.
+3. ✅ Training observability: text metrics (`step|loss|gnorm|lr|tok/s|mem|eta`) + TensorBoard
+   (event files mirrored to local disk to work around blobfuse append-read; viewed via SSH tunnel).
+4. Try an 8B model multi-node (192 GB/GPU leaves ample headroom).
+5. Scale data (FineWeb-Edu / Nemotron-CC) and lengthen the run.

@@ -13,7 +13,7 @@ def _tiny():   # ~50M core + big embed, for TinyStories smoke test on 1 GPU
     return ModelArgs(vocab_size=VOCAB_SIZE, dim=512, n_layers=8, n_heads=8,
                      n_kv_heads=4, ffn_hidden=1408, max_seq_len=1024)
 
-def _1b():     # ~1.1B core, real pipeline validation on FineWeb-10BT
+def _1b():     # ~1.444B params (incl. embeddings), real pipeline validation on FineWeb-10BT
     return ModelArgs(vocab_size=VOCAB_SIZE, dim=2048, n_layers=24, n_heads=16,
                      n_kv_heads=8, ffn_hidden=5632, max_seq_len=2048)
 

@@ -1,19 +1,21 @@
 # pretrain
 
-Pretraining an 8B dense, decoder-only LLM (Llama-style) from scratch.
+Pretraining an 8B dense, decoder-only LLM (**Chimera**, a Qwen3-style backbone) from scratch.
 
 Current goal: get the full training pipeline running end-to-end with **FSDP2**
-on the A100 cluster, then scale to MI300 + full data. For now we only care about
-"it runs + the loss curve is healthy", not performance.
+on the MI300 cluster (primary). A100 is single-node only. For now we care mostly about
+"it runs + the loss curve is healthy", not peak performance.
 
 ## Compute
 
 | Cluster | Size | Use |
 |---|---|---|
-| A100 | 8 nodes × 4 GPUs | Data pipeline, 1B ablations, eval / post-training |
-| MI300 | 4 nodes × 16 GPUs | Main production training |
+| MI300 | 4 nodes × 8 GPUs (32 total) | Main production multi-node training (8× InfiniBand HCA) |
+| A100 | single-node only (no InfiniBand) | Data pipeline, 1B ablations, eval / post-training |
 
-The two clusters are used independently; we do not train across clusters.
+The A100 SKU (NC A100 v4) has **no InfiniBand**, so multi-node FSDP hangs after step 0;
+all multi-node training runs on MI300. The two clusters are used independently; we do
+not train across clusters.
 
 ## Layout
 
@@ -27,7 +29,7 @@ The two clusters are used independently; we do not train across clusters.
 ```bash
 cd src
 bash download_data.sh   # download data
-bash run_smoke.sh       # single-node 4×A100 smoke test (tiny model + TinyStories)
+bash run_smoke.sh       # single-node smoke test (tiny model + TinyStories)
 ```
 
 For multi-node training, path conventions, and dependencies, see [`src/README.md`](src/README.md).

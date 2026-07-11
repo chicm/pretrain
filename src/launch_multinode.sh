@@ -16,7 +16,7 @@ for i in "${!NODES[@]}"; do
   echo "launching NODE_RANK=$i on $n (master=$MASTER_ADDR)"
   su "$TRUST_USER" -c "ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no $n \
     'cd $WORKDIR/src && source ~/.bashrc && conda activate $CONDA_ENV 2>/dev/null; \
-     NNODES=4 GPUS_PER_NODE=4 NODE_RANK=$i MASTER_ADDR=$MASTER_ADDR MASTER_PORT=29500 \
+     NNODES=4 GPUS_PER_NODE=8 NODE_RANK=$i MASTER_ADDR=$MASTER_ADDR MASTER_PORT=29500 \
      nohup bash run_multinode.sh > $WORKDIR/train_node${i}.log 2>&1 &'" &
 done
 wait

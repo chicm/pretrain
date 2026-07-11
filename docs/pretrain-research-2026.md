@@ -2,18 +2,18 @@
 
 > 调研日期：2026-07-10（框架选型/近期进展更新）
 > 适用场景：从零开始预训练一个 7B–10B 规模的 dense 语言模型
-> 可用算力：集群1 = 8 节点 × 4×A100；集群2 = 4 节点 × 16×MI300
+> 可用算力：集群1 = 8 节点 × 4×A100（32 卡，单机可用，无 IB）；集群2 = 4 节点 × 8×MI300X（32 卡，主力，有 IB）
 >
-> **当前决策（2026-07-10）**：第一步先用 **FSDP2 + 小数据集（FineWeb sample-10BT）**，在 **A100 集群** 上把训练代码全流程跑通，再 scale 到 MI300 + 全量数据。
+> **当前决策（2026-07 更新）**：用 **FSDP2 + FineWeb sample-10BT** 在 **MI300 集群**（主力）上跑通并做真实数据训练；A100 集群因 NC SKU 无 InfiniBand，仅单机可用（数据流水线 / 1B 消融 / 评测）。多机训练全部在 MI300。
 
 ---
 
 ## 0. 一页速览（TL;DR）
 
-- **算力够用**：MI300 集群（64 卡）是主力，训练 8B / 2–3T tokens 约需 **1.5–2 个月**；A100 集群（32 卡）单独跑全量太慢，定位为**数据流水线 + 小模型消融 + 评测/后训练**。
+- **算力够用**：MI300 集群（32 卡 MI300X，192GB HBM3/卡）是主力，训练 8B / 2–3T tokens 约需 **3–4 个月**；A100 集群（32 卡，无 IB 仅单机）定位为**数据流水线 + 小模型消融 + 评测/后训练**。
 - **不要跨集群合并训练**：A100 与 MI300 指令集/通信库不同，且两集群间无 InfiniBand 互联，异构并行会被拖死。
 - **训练框架**：大厂（DeepSeek/Qwen/GLM）底座都是 **Megatron 系**，但那是为百 B MoE 服务的。7–10B dense 用 **FSDP2** 更简单够用。**本项目起步：FSDP2**（TorchTitan 或纯 PyTorch），日后要训 MoE/30B+ 才迁 Megatron。
-- **模型结构**：选 **dense decoder-only**（不上 MoE）。对齐 2026 主流：GQA + RoPE + RMSNorm(Pre-Norm) + SwiGLU，可借鉴 Gemma4 的「滑动窗口 + 全局注意力交替」。
+- **模型结构**：选 **dense decoder-only（命名 Chimera）**。对齐 2026 主流：GQA + RoPE + RMSNorm(Pre-Norm) + SwiGLU + **QK-Norm**，可选借鉴 Gemma 的「滑动窗口 + 全局注意力交替」（预训练阶段关闭，全 full attention）。不上 soft-capping。
 - **最该抄的配方**：**OLMo 3-7B**（全流程开源，含数据+代码+recipe，官方称对标 Qwen3）+ **SmolLM3**（三阶段数据配比全公开）。Qwen/Gemma/GLM 只放权重不放配方，参考价值不如前两者。
 - **数据**：FineWeb-Edu / Nemotron-CC（网页）+ The Stack v2（代码）+ Dolma（书籍/论文/百科）+ 数学。退火阶段务必混入**合成/改写数据**（2026 头号质量变量）。
 - **Token 预算**：8B 训 **2–3T tokens 起步**（约 250–375 tokens/参数），预算充足可到 8T。避免极端过训练（>2000 tokens/参数会损害后续微调）。
@@ -28,23 +28,23 @@
 
 | 集群 | 配置 | 卡数 | 单卡 BF16 峰值 | 备注 |
 |---|---|---|---|---|
-| 集群1 | 8 节点 × 4×A100 | 32 | ~312 TFLOPS | A100-80GB |
-| 集群2 | 4 节点 × 16×MI300 | 64 | ~1.3 PFLOPS | MI300X，约为 A100 的 ~4× |
+| 集群1 | 8 节点 × 4×A100 | 32 | ~312 TFLOPS | A100-80GB（无 IB，仅单机） |
+| 集群2 | 4 节点 × 8×MI300X | 32 | ~1.3 PFLOPS | MI300X，约为 A100 的 ~4×（主力，有 IB） |
 
 按实际 MFU（有效算力利用率）35–40% 估算，训练 **8B 模型** 的墙钟时间：
 
-| Token 预算 | 集群2（64×MI300）单独 | 集群1（32×A100）单独 |
+| Token 预算 | 集群2（32×MI300X）单独 | 集群1（32×A100）单独 |
 |---|---|---|
-| 1T tokens | ~15–18 天 | ~4 个月 |
-| 3T tokens（推荐起步） | ~45–55 天 | 不现实（~1 年） |
-| 8T tokens（追 SOTA） | ~4–5 个月 | 不现实 |
-| 15T tokens（Llama3 级） | ~9–11 个月 | 不现实 |
+| 1T tokens | ~30–36 天 | ~4 个月 |
+| 3T tokens（推荐起步） | ~3–3.5 个月 | 不现实（~1 年） |
+| 8T tokens（追 SOTA） | ~8–10 个月 | 不现实 |
+| 15T tokens（Llama3 级） | 不现实 | 不现实 |
 
 > 注：以上为**数量级估算**。实际会因 MI300 具体型号（X/325/355）、互联带宽、并行策略而变化，正式立项前应以集群实测吞吐为准。
 
 ### 1.2 结论
 
-- **MI300 集群是绝对主力**，64 卡跑 8B、2–3T tokens 完全可行。
+- **MI300 集群是绝对主力**，32 卡跑 8B、2–3T tokens 可行（约 3–4 个月）。
 - **A100 集群单独跑全量预训练太慢**，最佳定位：
   - 数据清洗/去重/tokenize 流水线
   - 1B proxy 模型的架构与数据配比消融实验
@@ -249,7 +249,7 @@ ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", st
 ### 阶段 0：环境 + 跑通代码 ✅ 已完成
 > 关键变更：原计划在 A100 集群做多机验证，但实测 **A100 (NC A100 v4 SKU) 无 InfiniBand**（仅以太网加速网络，无 `/dev/infiniband`），多机 FSDP 受 TCP 延迟限制在 step 0 后即挂死——**A100 多机是死胡同**。因此多机验证全部转到 **MI300 集群**（有 8×IB HCA、192GB HBM3/卡、8 GPU/节点），MI300 成为主力平台。
 - ✅ 装好 PyTorch + FSDP2（`torch.distributed.fsdp.fully_shard`）；A100 用 CUDA，MI300 用 ROCm 6.4 + RCCL。
-- ✅ 小模型（~1B，Llama 结构 GQA+RoPE+RMSNorm+SwiGLU）实现完成。
+- ✅ 小模型（~1B，**Chimera** = Qwen3 结构 GQA+RoPE+RMSNorm+SwiGLU+QK-Norm）实现完成。1b preset 实际 ~1.444B 参数（含 embedding）。
 - ✅ **TinyStories** tokenize（473,992,236 tokens）→ 冒烟测试通过：A100 单机 loss 收敛；MI300 单机 ~1.88M tok/s（≈4× A100）。
 - ✅ **MI300 多机 1B 训练跑通（核心里程碑）**：4 节点 × 8 GPU = 32 卡，IB/RCCL，~11s/step、~928K tok/s，loss 平滑下降，checkpoint 中途+结尾均正确保存（ROCm 上集合通信保存逻辑验证无误），干净退出。
 - ✅ checkpoint 存/恢复验证（`get_model_state_dict(full_state_dict=True)`，全 rank 参与、master 落盘）。
@@ -258,10 +258,10 @@ ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", st
 > 变更：数据格式改用**自研 packed `.bin` + memmap**（配合 FSDP2 训练循环），不用 Megatron mmap 格式。
 - ✅ TinyStories 全流程打通。
 - ✅ 存储分层确定：**代码** → 各节点本地盘（git 同步，强一致，避免网络文件系统缓存）；**数据/checkpoint** → 共享存储（大文件顺序读写快）；**HF 下载缓存** → 本地盘（切忌写共享盘，小文件极慢）。
-- 🔄 优化 `data.py` 逐 token 填充循环（向量化）。
-- ⬜ tokenize **FineWeb `sample-10BT`**（HF `HuggingFaceFW/fineweb`）→ 真实数据多机训练。
+- ✅ 优化 `data.py` 逐 token 填充循环（已向量化：memmap + 批量 `np.concatenate`）。
+- ✅ tokenize **FineWeb `sample-10BT`**（HF `HuggingFaceFW/fineweb`）→ ~10.2B tokens（uint32）→ 真实数据多机训练已启动。
 - ⬜ 扩充数据：FineWeb-Edu + Nemotron-CC + The Stack v2 + Dolma；去重、质量过滤。
-- ⬜ 确定 tokenizer（先复用 Qwen3/Gemma tokenizer）。
+- ✅ 确定 tokenizer：**Qwen3**（`Qwen/Qwen3-8B`，vocab padded 151936，eot `<|endoftext|>` id 151643）。
 
 ### 阶段 2：小模型消融 ⬜ 待办（MI300 集群）
 - 用 **1B proxy 模型**，在 ~50–100B token 上跑几组数据配比 / 学习率消融。
@@ -283,16 +283,17 @@ ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", st
 
 ## 7. 关键决策清单（Checklist）
 
-- [ ] 主力模型 = 8B dense decoder-only（不上 MoE）
-- [ ] 起步框架 = FSDP2（A100 跑通 → MI300 正式）；MoE/30B+ 才迁 Megatron
-- [ ] 第一步 = TinyStories(~1GB)秒级跑通 → FineWeb sample-10BT(~28GB) + 1B 模型，A100 上用 FSDP2 跑通
-- [ ] 主训练集群 = MI300（FSDP2，必要时加 TP=2）
-- [ ] A100 集群 = 跑通/数据流水线 + 1B 消融 + 评测/后训练
+- [x] 主力模型 = 8B dense decoder-only（Chimera，Qwen3 结构，不上 MoE）
+- [x] 起步框架 = FSDP2（MI300 多机跑通）；MoE/30B+ 才迁 Megatron
+- [x] 第一步 = TinyStories(~1GB)秒级跑通 → FineWeb sample-10BT(~10.2B tokens) + 1B 模型，MI300 上用 FSDP2 跑通
+- [x] 主训练集群 = MI300（FSDP2，必要时加 TP=2）
+- [x] A100 集群 = 单机数据流水线 + 1B 消融 + 评测/后训练（无 IB，多机不可用）
+- [x] tokenizer = Qwen3（vocab 151936）
 - [ ] 配方模板 = OLMo 3-7B（主）+ SmolLM3（辅）
 - [ ] Token 预算 = 2–3T 起步（避免 >2000 tokens/param 极端过训练）
 - [ ] 退火阶段混入合成/改写数据
-- [ ] 正式跑前用 modded-nanogpt + 1B proxy 验证架构
-- [ ] 不跨集群合并训练
+- [ ] 正式跑前用 1B proxy 验证架构（已用 FineWeb 1B 验证观测/收敛）
+- [x] 不跨集群合并训练
 
 ---
 

@@ -6,7 +6,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `model.py` | Llama 结构模型：GQA + RoPE + RMSNorm + SwiGLU，用 SDPA(flash) |
+| `model.py` | Chimera（Qwen3 结构）：GQA + RoPE + RMSNorm + SwiGLU + QK-Norm，用 SDPA(flash) |
 | `configs.py` | 模型预设（tiny/1b/8b）+ 训练超参 |
 | `data.py` | tokenize 成 packed `.bin` + memmap 数据加载 |
 | `tokenize_data.py` | 一次性预处理入口 |
