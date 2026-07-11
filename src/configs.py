@@ -53,3 +53,6 @@ class TrainConfig:
     dtype: str = "bfloat16"
     compile: bool = True
     seed: int = 1337
+    # --- observability ---
+    tensorboard: bool = True     # write TB event files to <out_dir>/tb
+    tb_dir: str = ""             # override; default = <out_dir>/tb

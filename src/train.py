@@ -152,6 +152,17 @@ def main():
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
+    # TensorBoard writer on master rank only (event files -> shared disk)
+    writer = None
+    if is_master() and getattr(cfg, "tensorboard", False):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = cfg.tb_dir or os.path.join(cfg.out_dir, "tb")
+            os.makedirs(tb_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir=tb_dir)
+            log(f"[tb] TensorBoard logging to {tb_dir}")
+        except Exception as e:
+            log(f"[tb] disabled ({e})")
     model.train()
     step = 0
     if args.resume:
@@ -179,25 +190,41 @@ def main():
             loss = loss / cfg.grad_accum
             loss.backward()
             loss_mean += loss.item()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
-
         if step % cfg.log_every == 0:
             dt = time.time() - t0
             tps = tokens_per_step * cfg.log_every / dt if step > 0 else 0
-            log(f"step {step:6d} | loss {loss_mean:.4f} | lr {lr:.2e} | "
-                f"{tps/1e3:.1f}K tok/s | {dt:.1f}s")
+            gn = grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+            mem = torch.cuda.max_memory_allocated() / 1e9
+            # ETA from current throughput
+            eta_s = (cfg.max_steps - step) * (dt / cfg.log_every) if step > 0 else 0
+            eta_h = eta_s / 3600
+            log(f"step {step:6d} | loss {loss_mean:.4f} | gnorm {gn:.3f} | "
+                f"lr {lr:.2e} | {tps/1e3:.1f}K tok/s | mem {mem:.1f}G | eta {eta_h:.1f}h")
+            if writer is not None and step > 0:
+                writer.add_scalar("train/loss", loss_mean, step)
+                writer.add_scalar("train/grad_norm", gn, step)
+                writer.add_scalar("train/lr", lr, step)
+                writer.add_scalar("perf/tokens_per_sec", tps, step)
+                writer.add_scalar("perf/mem_gb", mem, step)
+                writer.add_scalar("progress/tokens", step * tokens_per_step, step)
+            torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
         if cfg.eval_every > 0 and step > 0 and step % cfg.eval_every == 0:
             val_loss = evaluate(model, val_loader, cfg.eval_batches)
             if val_loss is not None:
                 log(f"step {step:6d} | val_loss {val_loss:.4f}")
+                if writer is not None:
+                    writer.add_scalar("val/loss", val_loss, step)
             t0 = time.time()   # don't count eval time in tok/s
         if step > 0 and step % cfg.ckpt_every == 0:
             save_ckpt(model, opt, step, cfg)
         step += 1
 
     save_ckpt(model, opt, step, cfg)
+    if writer is not None:
+        writer.close()
     log("[done] training complete")
     dist.destroy_process_group()
 
