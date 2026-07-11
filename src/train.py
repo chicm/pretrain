@@ -173,7 +173,7 @@ def main():
             log(f"[tb] disabled ({e})")
     model.train()
     step = 0
-    if args.resume:
+    skipped_steps = 0    if args.resume:
         step = load_ckpt(model, opt, args.resume)
     t0 = time.time()
     tokens_per_step = cfg.micro_bsz * cfg.grad_accum * world * cfg.block_size
@@ -199,7 +199,18 @@ def main():
             loss.backward()
             loss_mean += loss.item()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        opt.step()
+        # Skip the optimizer step on non-finite grads (inf/nan). Without this a
+        # single spiky micro-batch permanently poisons the weights and every
+        # subsequent step is NaN. Skipping keeps training recoverable.
+        gn_finite = torch.isfinite(grad_norm).item() if hasattr(grad_norm, "item") \
+            else math.isfinite(float(grad_norm))
+        if gn_finite:
+            opt.step()
+        else:
+            opt.zero_grad(set_to_none=True)
+            skipped_steps += 1
+            log(f"[warn] step {step}: non-finite grad_norm, skipping optimizer step "
+                f"(total skipped={skipped_steps})")
         if step % cfg.log_every == 0:
             dt = time.time() - t0
             tps = tokens_per_step * cfg.log_every / dt if step > 0 else 0
