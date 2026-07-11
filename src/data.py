@@ -35,30 +35,80 @@ def prepare_data(dataset_name, out_dir, tokenizer, split="train",
             if max_docs and i + 1 >= max_docs:
                 break
         arr = np.array(all_ids, dtype=dtype)
+        n_val = int(len(arr) * val_frac)
+        if n_val > 0:
+            arr[:-n_val].tofile(os.path.join(out_dir, "train.bin"))
+            arr[-n_val:].tofile(os.path.join(out_dir, "val.bin"))
+        else:
+            arr.tofile(os.path.join(out_dir, "train.bin"))
+        total_tokens = int(len(arr))
     else:
         ds = ds.map(tok, remove_columns=ds.column_names, num_proc=num_proc,
                     desc="tokenizing")
         total = int(np.sum(ds["len"], dtype=np.int64))
-        arr = np.zeros(total, dtype=dtype)
-        idx = 0
-        for batch in ds.iter(batch_size=1000):
-            for ids in batch["ids"]:
-                arr[idx: idx + len(ids)] = ids
-                idx += len(ids)
+        n_val = int(total * val_frac)
+        n_train = total - n_val
 
-    n_val = int(len(arr) * val_frac)
-    if n_val > 0:
-        arr[:-n_val].tofile(os.path.join(out_dir, "train.bin"))
-        arr[-n_val:].tofile(os.path.join(out_dir, "val.bin"))
-    else:
-        arr.tofile(os.path.join(out_dir, "train.bin"))
+        # Write directly to disk-backed memmaps, filling in large batched
+        # concatenations (vectorized) instead of a per-doc Python loop.
+        train_path = os.path.join(out_dir, "train.bin")
+        val_path = os.path.join(out_dir, "val.bin") if n_val > 0 else None
+        train_mm = np.memmap(train_path, dtype=dtype, mode="w+", shape=(n_train,))
+        val_mm = (np.memmap(val_path, dtype=dtype, mode="w+", shape=(n_val,))
+                  if val_path else None)
+
+        ds = ds.with_format("numpy")
+        write_batch = 8192  # docs per flush; concat then bulk-assign
+        tidx = vidx = 0
+        buf, buf_len = [], 0
+        FLUSH = 1 << 24  # ~16M tokens per flush chunk
+
+        def flush(chunk):
+            nonlocal tidx, vidx
+            # route into train / val by absolute position (val is the tail)
+            done = tidx + vidx
+            for seg_dst, seg in _split_train_val(chunk, done, n_train):
+                if seg_dst == "train":
+                    train_mm[tidx: tidx + len(seg)] = seg
+                    tidx += len(seg)
+                else:
+                    val_mm[vidx: vidx + len(seg)] = seg
+                    vidx += len(seg)
+
+        for batch in ds.iter(batch_size=write_batch):
+            # batch["ids"] is a list of 1-D numpy arrays -> one C-level concat
+            buf.append(np.concatenate(list(batch["ids"])))
+            buf_len += len(buf[-1])
+            if buf_len >= FLUSH:
+                flush(np.concatenate(buf))
+                buf, buf_len = [], 0
+        if buf:
+            flush(np.concatenate(buf))
+
+        train_mm.flush()
+        if val_mm is not None:
+            val_mm.flush()
+        del train_mm, val_mm
+        total_tokens = total
     meta = {"dtype": np.dtype(dtype).name, "vocab_size": tokenizer.vocab_size,
-            "eot": eot, "total_tokens": int(len(arr))}
+            "eot": eot, "total_tokens": int(total_tokens)}
     import json
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"[prepare_data] wrote {len(arr):,} tokens to {out_dir} (dtype={dtype})")
+    print(f"[prepare_data] wrote {total_tokens:,} tokens to {out_dir} (dtype={dtype})")
     return meta
+
+
+def _split_train_val(chunk, abs_start, n_train):
+    """Route a token chunk (starting at absolute position abs_start) into
+    train (positions < n_train) and val (>= n_train) segments."""
+    end = abs_start + len(chunk)
+    if end <= n_train:
+        return [("train", chunk)]
+    if abs_start >= n_train:
+        return [("val", chunk)]
+    cut = n_train - abs_start
+    return [("train", chunk[:cut]), ("val", chunk[cut:])]
 
 
 class PackedDataset(Dataset):
