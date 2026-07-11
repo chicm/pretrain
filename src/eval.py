@@ -121,7 +121,7 @@ def make_lm_class():
             self.model = model
             self.tok = tokenizer
             self._max_length = int(max_length)
-            self.device = device
+            self._device = device
             self.batch_size = int(batch_size)
             self.dtype = dtype
             # Qwen3 has no dedicated BOS; use <|endoftext|> as the prefix token
@@ -155,11 +155,11 @@ def make_lm_class():
             """
             maxlen = max(len(ids) for ids, _ in batch)
             input_ids = torch.full((len(batch), maxlen), self.prefix_id,
-                                   dtype=torch.long, device=self.device)
+                                   dtype=torch.long, device=self._device)
             for i, (ids, _) in enumerate(batch):
-                input_ids[i, : len(ids)] = torch.tensor(ids, device=self.device)
+                input_ids[i, : len(ids)] = torch.tensor(ids, device=self._device)
 
-            with torch.autocast(device_type=self.device.split(":")[0],
+            with torch.autocast(device_type=self._device.split(":")[0],
                                 dtype=self.dtype):
                 logits, _ = self.model(input_ids)
             logits = logits.float()
@@ -173,7 +173,7 @@ def make_lm_class():
                 start = seq_len - cont_len
                 # logits at position t predict token t+1
                 pred_slice = logprobs[i, start - 1: seq_len - 1, :]   # (cont_len, V)
-                target = torch.tensor(ids[start:seq_len], device=self.device)
+                target = torch.tensor(ids[start:seq_len], device=self._device)
                 tok_lp = pred_slice.gather(1, target.unsqueeze(1)).squeeze(1)
                 greedy = (pred_slice.argmax(-1) == target).all().item()
                 out.append((tok_lp.sum().item(), bool(greedy)))
