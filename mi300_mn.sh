@@ -18,6 +18,8 @@ OUT=${OUT:-$SHARED/checkpoints/mn_1b}
 MAX_STEPS=${MAX_STEPS:-500}
 MICRO_BSZ=${MICRO_BSZ:-8}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
+MODEL=${MODEL:-1b}
+RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs
 mkdir -p "$OUT" "$LOGDIR"
 rm -f "$LOGDIR"/mn_node*.log
@@ -34,8 +36,8 @@ for i in 0 1 2 3; do
     export HF_HOME=/scratch/hf_local OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
     export NCCL_DEBUG=WARN NCCL_SOCKET_IFNAME=eth0 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 PYTHONUNBUFFERED=1
     nohup torchrun --nnodes=4 --nproc_per_node=8 --node_rank=$i \
-      --rdzv_id=mn1b --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
-      train.py --model 1b --data_dir $DATA --out_dir $OUT \
+      --rdzv_id=$RDZV_ID --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
+      train.py --model $MODEL --data_dir $DATA --out_dir $OUT \
       --micro_bsz $MICRO_BSZ --grad_accum $GRAD_ACCUM --max_steps $MAX_STEPS --no_compile \
       > $LOGDIR/mn_node${i}.log 2>&1 &
   " &
