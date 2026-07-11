@@ -12,6 +12,7 @@ REPO=${REPO:-https://github.com/chicm/pretrain.git}
 LOCAL=${LOCAL:-/scratch/code}
 SHARED=${SHARED:?set SHARED to the shared work dir}
 CONDA_ENV=${CONDA_ENV:-base}
+BRANCH=${BRANCH:-dev-chicm}
 DATA=$SHARED/data/tinystories_tok
 OUT=$SHARED/checkpoints/mn_1b
 LOGDIR=$SHARED/logs
@@ -24,7 +25,7 @@ for i in 0 1 2 3; do
     set -e
     # --- sync code to LOCAL disk (avoids network-FS cache issues) ---
     git config --global --add safe.directory $LOCAL 2>/dev/null || true
-    if [ -d $LOCAL/.git ]; then cd $LOCAL && git fetch -q origin && git reset -q --hard origin/main; else rm -rf $LOCAL && git clone -q $REPO $LOCAL; fi
+    if [ -d $LOCAL/.git ]; then cd $LOCAL && git fetch -q origin && git checkout -q $BRANCH 2>/dev/null && git reset -q --hard origin/$BRANCH; else rm -rf $LOCAL && git clone -q -b $BRANCH $REPO $LOCAL; fi
     echo \\\"[$n] code HEAD: \\\$(cd $LOCAL && git rev-parse --short HEAD)\\\"
     cd $LOCAL/src
     source /opt/conda/etc/profile.d/conda.sh; conda activate $CONDA_ENV
