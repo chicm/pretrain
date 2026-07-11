@@ -13,8 +13,11 @@ LOCAL=${LOCAL:-/scratch/code}
 SHARED=${SHARED:?set SHARED to the shared work dir}
 CONDA_ENV=${CONDA_ENV:-base}
 BRANCH=${BRANCH:-dev-chicm}
-DATA=$SHARED/data/tinystories_tok
-OUT=$SHARED/checkpoints/mn_1b
+DATA=${DATA:-$SHARED/data/tinystories_tok}
+OUT=${OUT:-$SHARED/checkpoints/mn_1b}
+MAX_STEPS=${MAX_STEPS:-500}
+MICRO_BSZ=${MICRO_BSZ:-8}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
 LOGDIR=$SHARED/logs
 mkdir -p "$OUT" "$LOGDIR"
 rm -f "$LOGDIR"/mn_node*.log
@@ -34,7 +37,7 @@ for i in 0 1 2 3; do
     nohup torchrun --nnodes=4 --nproc_per_node=8 --node_rank=$i \
       --rdzv_id=mn1b --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
       train.py --model 1b --data_dir $DATA --out_dir $OUT \
-      --micro_bsz 8 --grad_accum 2 --max_steps 500 --no_compile \
+      --micro_bsz $MICRO_BSZ --grad_accum $GRAD_ACCUM --max_steps $MAX_STEPS --no_compile \
       > $LOGDIR/mn_node${i}.log 2>&1 &
   " &
 done
