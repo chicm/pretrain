@@ -21,7 +21,7 @@ Chimera 1B（Qwen3 结构 + QK-Norm）在 FineWeb-10BT 真实数据上，用 FSD
 |---|---|
 | 模型 | **Chimera 1B**（class Chimera / alias Transformer） |
 | 参数量 | **1.444B**（含 embedding；vocab 151936 使 embedding 增大） |
-| 架构 | dim 4096 · 32 层 · 32 Q / 8 KV 头（GQA 4:1）· SwiGLU 14336 · RoPE · RMSNorm pre-norm · **QK-Norm on** · 全 full attention（滑窗关闭） |
+| 架构 | dim 2048 · 24 层 · 16 Q / 8 KV 头（GQA 2:1）· SwiGLU 5632 · RoPE · RMSNorm pre-norm · **QK-Norm on** · 全 full attention（滑窗关闭） |
 | 分词器 | Qwen3（`Qwen/Qwen3-8B`），vocab padded 151936 |
 | 数据 | FineWeb sample-10BT，~10.2B tokens（uint32），eot `<|endoftext|>` id 151643 |
 | 框架 | FSDP2（`fully_shard`，逐层 + 整体） |
@@ -81,16 +81,36 @@ train/val 接近，**无过拟合迹象**。
   → 本地 `tunnel.py` 转发 → 浏览器 `localhost:6006`
 - **32 卡硬件快照**：`_gpumon.sh`（rocm-smi）
 
-## 8. 结论与下一步
+## 8. 评测结果（ckpt_2000，lm-eval-harness）
+
+**2026-07-11 补充**：用 `eval.py`（EleutherAI lm-eval-harness 适配器，单卡，
+log-likelihood 打分）对 `ckpt_2000.pt` 评测。
+
+| 任务 | 指标 | 得分 | 随机基线 | 解读 |
+|---|---|---|---|---|
+| **HellaSwag** | acc_norm | **29.3%** | 25% | 略高于随机，刚起步 |
+| **LAMBADA (openai)** | acc | **21.3%** | ~0% | **真实信号** ✓ |
+| | perplexity | 153.9 | — | 早期偏高但合理 |
+| **ARC-easy** | acc | **38.6%** | 25% | **明显高于随机** ✓ |
+| **ARC-challenge** | acc_norm | 20.9% | 25% | 噪声内（题难，正常）|
+
+**关键结论**：LAMBADA（长文末词预测）21.3% 与 ARC-easy（真实科学题）38.6% 都
+明显超随机 → 模型确实学到了语言建模与部分常识，**不是 loss 好看但学废**。
+HellaSwag/ARC-c 仍贴近随机属预期（仅 20 亿 token，成熟 1B 训 1T+ token 时
+HellaSwag 约 45–60%、LAMBADA 约 50%）。核心价值是 **eval.py 全链路跑通** +
+**下游非随机信号确认**。
+
+- 结果文件：`$SHARED/eval_out/eval_ckpt_2000.json`
+- MMLU 此规模 ≈ 随机 25%，留待 ≥7B + 数千亿 token。
+
+## 9. 结论与下一步
 
 **验证通过的能力**：Chimera 架构（QK-Norm）、Qwen3 大词表（151936）、FineWeb 真实数据
-管线、FSDP2 32 卡多机、真 IB 通信、观测栈、checkpoint。全部 green。
+管线、FSDP2 32 卡多机、真 IB 通信、观测栈、checkpoint、**评测管线**。全部 green。
 
 **下一步候选**：
-1. **评测**：用 `eval.py`（lm-eval-harness）跑 HellaSwag / LAMBADA / ARC，看 1B/20亿token
-   的下游信号（MMLU 此规模约等随机 25%，暂不作主指标）。
-2. **8B 模型**：显存有充足余量（82/192 GB），可尝试 8B 多机。
-3. **扩数据 + 拉长**：FineWeb-Edu / Nemotron-CC，max_steps 上量做真正的预训练。
+1. **8B 模型**：显存有充足余量（82/192 GB），可尝试 8B 多机。
+2. **扩数据 + 拉长**：FineWeb-Edu / Nemotron-CC，max_steps 上量做真正的预训练。
 
 > 注：本 run 是**管线与架构验证**（proxy），非追求终模型质量。20 亿 token 对 1B 模型
 > 远未训练充分，loss 仍在下降空间内。
