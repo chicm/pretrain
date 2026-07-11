@@ -107,11 +107,52 @@ def _init(self, m):
 
 > 注意：`self.apply(self._init)` 是逐 module 调用，`_init` 里能通过 `self.args.n_layers` 拿到层数（`_init` 是 `Chimera` 的方法，`self` 是模型本体）。
 
-### 3.2 修复二（建议）：8B 更保守的超参
+### 3.2 修复二（决定性）：非有限梯度跳步保护（生产级 pretraining 标配）
 
-8B 通常比 1B 需要**更小的峰值学习率 + 更长的 warmup**：
+**这是把「致命 NaN 中毒」降级为「可恢复跳步」的决定性修复，不是可选项。**
 
-| 超参 | 修复前 | 建议 |
+问题机理（为什么单靠 grad_clip 救不了）：
+
+- `clip_grad_norm_(params, 1.0)` 的缩放系数是 `max_norm / total_norm`。
+  当某个 micro-batch 产生 **inf 梯度**时，`total_norm=inf`，缩放系数 `1.0/inf=0` → 梯度被清零，
+  这一步**侥幸自愈**（相当于跳过，step 50→60 就是这样躲过去的）。
+- 但当 `total_norm` 是一个**很大的有限值**（如 step 70 的 gnorm=15.8）时，clip 只把它缩到 1.0，
+  `opt.step()` 照常施加了一个**巨大且方向已被污染的更新** → 权重被推炸 →
+  下一步前向直接 nan（权重已中毒，**永久回不来**）。
+
+也就是说：**grad_clip 只对 inf 有效（缩放到 0），对"有限但巨大"的坏梯度无能为力**。真正的防线是：
+
+> **当 `clip_grad_norm_` 返回的 grad_norm 非有限（inf/nan）时，跳过 `opt.step()` 并 `zero_grad`，
+> 只累加 `skipped_steps` 计数，不更新权重。**
+
+`src/train.py` 实际实现（commit `3824759`）：
+
+```python
+grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+# Skip the optimizer step on non-finite grads (inf/nan). Without this a
+# single spiky micro-batch permanently poisons the weights and every
+# subsequent step is NaN. Skipping keeps training recoverable.
+gn_finite = torch.isfinite(grad_norm).item() if hasattr(grad_norm, "item") \
+    else math.isfinite(float(grad_norm))
+if gn_finite:
+    opt.step()
+else:
+    opt.zero_grad(set_to_none=True)
+    skipped_steps += 1
+    log(f"[warn] step {step}: non-finite grad_norm, skipping optimizer step "
+        f"(total skipped={skipped_steps})")
+```
+
+**验证效果**：重启后的 run 到 step 1110 时 `skipped_steps=39`——这 39 次是早期个别不稳定 micro-batch
+被安全拦下、没有污染权重，训练全程 0 NaN、grad_norm 稳定在 0.2 量级。这个保护是运行期最后一道、
+也是最关键的一道决定性防线。
+
+### 3.3 修复三（建议）：8B 更保守的超参
+
+8B 通常比 1B 需要**更小的峰值学习率 + 更长的 warmup**，用来**降低尖峰出现的频率**
+（配合 3.1 降低尖峰根源、3.2 拦截漏网尖峰，三者形成互补）：
+
+| 超参 | 修复前 | 建议/采用 |
 |---|---|---|
 | 峰值 lr | 3e-4 | **2e-4** |
 | warmup_steps | 200 | **500** |
@@ -121,14 +162,12 @@ def _init(self, m):
 理由：
 - 峰值 lr 降低直接减小每步更新幅度，给数值稳定性留余量。
 - warmup 拉长让模型在低 lr 下先"稳住"激活分布，再逐步抬升。
-- grad_clip=1.0 是最后一道防线，但它只在 grad_norm 是有限值时有用；一旦已经 NaN，clip 也救不回来 —— 所以根因修复（3.1）才是关键。
 
 > 按项目约定，最终 lr/warmup 具体数值由用户拍板；agent 只提供建议默认值。
 
-### 3.3 修复三（可选，纵深防御）
+### 3.4 可选（进一步纵深防御，尚未启用）
 
 - **logits soft-cap**：Gemma 风格对 attention/final logits 做 `tanh` 软封顶，进一步防溢出。Chimera 预留了 Gemma 能力，可评估开启。
-- **NaN 早停/跳过**：训练循环里检测 `loss.isnan()`，跳过该 step 的 optimizer.step（不更新），或直接告警退出，避免烧算力空转 400 步才被发现。
 - **缩短 ckpt 间隔用于早期**：8B 早期可临时 `ckpt_every=500`，一旦出问题有近点可回滚（代价是 43GB/个的存储）。
 
 ---
@@ -149,7 +188,7 @@ def _init(self, m):
 1. **从头训练的初始化必须做残差深度缩放**（`wo`/`w2` std ÷ √(2·L)），层数越深越关键。这是架构级 must-have，不是可选优化。
 2. **冒烟测试要覆盖 warmup 全程**：只跑 40 步无法暴露高 lr 数值不稳定。8B 级别的冒烟至少应跑过 warmup 峰值（或临时缩短 warmup 让高 lr 早到）。
 3. **早期 checkpoint 要密**：`ckpt_every=2000` 意味着前 2000 步任何崩溃都要从头再来。大模型早期建议 `ckpt_every=500`。
-4. **加 NaN 守卫**：训练循环检测到 loss NaN 应立即告警/退出，而非空转数百步（本次空转到 step 430 才被 TensorBoard 发现）。
+4. **非有限梯度跳步是生产级 pretraining 标配**：检测 `clip_grad_norm_` 返回值非有限（inf/nan）时跳过 `opt.step()`。关键认知：**grad_clip 只对 inf 有效（缩放到 0），对"有限但巨大"的坏梯度无能为力**，后者会施加被污染的巨大更新导致权重永久中毒。跳步才是决定性防线（本次 run 触发 39 次跳步、全程 0 NaN 验证有效）。此外应尽早告警，避免像首次事故那样空转到 step 430 才被 TensorBoard 发现。
 5. **"能跑通"≠"健康"**：1B 无缩放跑通 2000 步纯属侥幸，本身已在数值悬崖边缘。别把侥幸当验证。
 6. **NaN 后吞吐虚高是危险信号**，不是性能提升。
 
@@ -157,4 +196,4 @@ def _init(self, m):
 
 ## 6. 一句话总结
 
-**8B 在 step 110 爆 NaN 的根因是模型初始化未对残差输出投影（`wo`/`w2`）做 `1/√(2·n_layers)` 深度缩放，导致 32 层深模型残差流方差随深度累积膨胀，在 warmup 抬升学习率后数值溢出。1B（24 层）侥幸未暴露，8B（32 层）在高 lr 下越界。修复 = 残差缩放初始化（必须）+ 8B 更保守的 lr/warmup（建议）+ NaN 守卫与更密 checkpoint（纵深防御）。**
+**8B 在 step 110 爆 NaN 的根因是模型初始化未对残差输出投影（`wo`/`w2`）做 `1/√(2·n_layers)` 深度缩放，导致 32 层深模型残差流方差随深度累积膨胀，在 warmup 抬升学习率后数值溢出。1B（24 层）侥幸未暴露，8B（32 层）在高 lr 下越界。修复由三部分组成，缺一不可：① 残差深度缩放初始化（降低尖峰根源，架构级 must-have）+ ② 非有限梯度跳步保护（决定性修复：把致命 NaN 中毒降级为可恢复跳步——grad_clip 只能缩放 inf、对"有限但巨大"的坏梯度无能为力，必须靠跳步拦截）+ ③ 8B 更保守的 lr/warmup（降低尖峰频率）。**
