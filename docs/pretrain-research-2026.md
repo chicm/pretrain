@@ -229,31 +229,38 @@ ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", st
 
 ## 6. 实施路线（落地步骤）
 
-### 阶段 0：环境 + 跑通代码（~1 周，A100 集群）⭐ 当前优先
-- A100 集群装 PyTorch（含 FSDP2 / `torch.distributed.fsdp.fully_shard`），或直接用 TorchTitan。
-- 先用 **TinyStories (~1GB)** 秒级跑通冒烟测试，再换 **FineWeb `sample-10BT`**（~28GB）验证真实数据（HF `HuggingFaceFW/fineweb`），tokenize。
-- 配一个小模型（~1B Llama 结构：GQA+RoPE+RMSNorm+SwiGLU），用 **FSDP2** 单机多卡跑几百步。
-- 目标：验证分布式通信、loss 正常下降、checkpoint 能存能恢复。**先不追性能，只追跑通。**
-- （并行）MI300 集群：拉起 AMD ROCm PyTorch docker，验证 FSDP2 在 ROCm 上多机 RCCL 通信。
+> 进度标记：✅ 已完成 · 🔄 进行中 · ⬜ 待办。下方阶段划分保留原规划骨架，并对齐实际进展。
 
-### 阶段 1：数据流水线（~2–3 周，用 A100 集群）
-- 下载 FineWeb-Edu + Nemotron-CC + The Stack v2 + Dolma。
-- 去重、质量过滤、tokenize 成 Megatron mmap 格式。
-- 确定 tokenizer（先复用 Qwen3/Gemma tokenizer）。
+### 阶段 0：环境 + 跑通代码 ✅ 已完成
+> 关键变更：原计划在 A100 集群做多机验证，但实测 **A100 (NC A100 v4 SKU) 无 InfiniBand**（仅以太网加速网络，无 `/dev/infiniband`），多机 FSDP 受 TCP 延迟限制在 step 0 后即挂死——**A100 多机是死胡同**。因此多机验证全部转到 **MI300 集群**（有 8×IB HCA、192GB HBM3/卡、8 GPU/节点），MI300 成为主力平台。
+- ✅ 装好 PyTorch + FSDP2（`torch.distributed.fsdp.fully_shard`）；A100 用 CUDA，MI300 用 ROCm 6.4 + RCCL。
+- ✅ 小模型（~1B，Llama 结构 GQA+RoPE+RMSNorm+SwiGLU）实现完成。
+- ✅ **TinyStories** tokenize（473,992,236 tokens）→ 冒烟测试通过：A100 单机 loss 收敛；MI300 单机 ~1.88M tok/s（≈4× A100）。
+- ✅ **MI300 多机 1B 训练跑通（核心里程碑）**：4 节点 × 8 GPU = 32 卡，IB/RCCL，~11s/step、~928K tok/s，loss 平滑下降，checkpoint 中途+结尾均正确保存（ROCm 上集合通信保存逻辑验证无误），干净退出。
+- ✅ checkpoint 存/恢复验证（`get_model_state_dict(full_state_dict=True)`，全 rank 参与、master 落盘）。
 
-### 阶段 2：小模型消融（~1–2 周，A100 集群）
+### 阶段 1：数据流水线 🔄 进行中
+> 变更：数据格式改用**自研 packed `.bin` + memmap**（配合 FSDP2 训练循环），不用 Megatron mmap 格式。
+- ✅ TinyStories 全流程打通。
+- ✅ 存储分层确定：**代码** → 各节点本地盘（git 同步，强一致，避免网络文件系统缓存）；**数据/checkpoint** → 共享存储（大文件顺序读写快）；**HF 下载缓存** → 本地盘（切忌写共享盘，小文件极慢）。
+- 🔄 优化 `data.py` 逐 token 填充循环（向量化）。
+- ⬜ tokenize **FineWeb `sample-10BT`**（HF `HuggingFaceFW/fineweb`）→ 真实数据多机训练。
+- ⬜ 扩充数据：FineWeb-Edu + Nemotron-CC + The Stack v2 + Dolma；去重、质量过滤。
+- ⬜ 确定 tokenizer（先复用 Qwen3/Gemma tokenizer）。
+
+### 阶段 2：小模型消融 ⬜ 待办（MI300 集群）
 - 用 **1B proxy 模型**，在 ~50–100B token 上跑几组数据配比 / 学习率消融。
 - 确认 loss 曲线健康、无 spike。可先复现 SmolLM3/OLMo3 的 1B 设置。
 - 这一步能在正式跑前避免几十天的浪费。
 
-### 阶段 3：正式预训练（MI300 集群，~1.5–2 个月）
-- 8B dense，2–3T tokens。框架：**FSDP2**（若 MFU 不足或需扩上下文，再加 TP=2）。
+### 阶段 3：正式预训练 ⬜ 待办（MI300 集群，主力平台）
+- 8B dense，2–3T tokens。框架：**FSDP2**（若 MFU 不足或需扩上下文，再加 TP=2）。192GB HBM3/卡显存充裕，8B 有余量。
 - 架构对齐 Qwen3 / Gemma4。
 - BF16 + FSDP2（8B 规模纯 FSDP/ZeRO 即可，不需复杂 3D 并行）。
 - WSD 或 cosine 学习率，全局 batch ~4M tokens，勤存 checkpoint，监控 grad norm / loss spike。
 - **结尾退火（decay）阶段**：混入高质量 + 合成/改写数据、降 LR 收尾提质。
 
-### 阶段 4：评测与后训练（A100 集群）
+### 阶段 4：评测与后训练 ⬜ 待办
 - 评测：MMLU / MMLU-Pro / GSM8K / HumanEval / 中文评测；对标 OLMo3-7B、Qwen3。
 - 后训练：SFT + 偏好对齐（DPO/GRPO 等）。
 
