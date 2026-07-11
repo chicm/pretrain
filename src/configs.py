@@ -18,6 +18,12 @@ def _1b():     # ~1.1B core, real pipeline validation on FineWeb-10BT
                      n_kv_heads=8, ffn_hidden=5632, max_seq_len=2048)
 
 def _8b():     # ~8B, production (for later, on MI300)
+    # QK-Norm is on by default (ModelArgs.qk_norm=True). Hybrid sliding-window
+    # attention is OFF for pretraining (all layers full). For long-context
+    # extension later, set e.g.:
+    #   from model import make_gemma_layer_types
+    #   a = _8b(); a.sliding_window = 1024
+    #   a.layer_types = make_gemma_layer_types(a.n_layers, ratio=6)  # 5:1 + global last
     return ModelArgs(vocab_size=VOCAB_SIZE, dim=4096, n_layers=32, n_heads=32,
                      n_kv_heads=8, ffn_hidden=14336, max_seq_len=4096)
 

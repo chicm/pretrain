@@ -1,8 +1,20 @@
-"""Llama-style decoder-only transformer (GQA + RoPE + RMSNorm + SwiGLU).
+"""Chimera: a decoder-only transformer.
+
+Qwen3-style dense backbone (GQA + RoPE + RMSNorm + SwiGLU, no bias) plus two
+Gemma-inspired capabilities:
+  * QK-Norm  : RMSNorm on per-head query/key before attention (stabilizes
+               training, suppresses loss spikes). Enabled by default.
+  * Hybrid attention : each layer can be "full" (global causal) or "sliding"
+               (local causal window). Wired for a Gemma-style 5:1 local:global
+               interleave with a forced global last layer, but DISABLED by
+               default (all layers full) for pretraining at 4K-8K context.
+               Enable later for long-context (32K+) extension.
+
 Kept dependency-light so it works with plain PyTorch + FSDP2.
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,16 +22,42 @@ import torch.nn.functional as F
 
 @dataclass
 class ModelArgs:
-    vocab_size: int = 49152
+    vocab_size: int = 151936
     dim: int = 2048
     n_layers: int = 24
     n_heads: int = 16
     n_kv_heads: int = 8          # GQA: n_kv_heads < n_heads
-    ffn_hidden: int = 5632       # SwiGLU intermediate (~2.7x dim, multiple of 256)
+    ffn_hidden: int = 5632       # SwiGLU intermediate
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True
+    # --- Gemma-inspired extras ---
+    qk_norm: bool = True         # RMSNorm on per-head Q/K (default on)
+    sliding_window: int = 0      # local window size; 0 = no sliding (all full)
+    layer_types: Optional[List[str]] = None  # per-layer "full"/"sliding";
+                                              # None -> all "full" (pretrain default)
+
+    def resolved_layer_types(self):
+        """Return a list of length n_layers of 'full'/'sliding'.
+        If layer_types is None -> all full. If sliding_window<=0, everything is
+        forced to full regardless (so the hybrid path is fully off by default)."""
+        if self.layer_types is None or self.sliding_window <= 0:
+            return ["full"] * self.n_layers
+        assert len(self.layer_types) == self.n_layers
+        return list(self.layer_types)
+
+
+def make_gemma_layer_types(n_layers: int, ratio: int = 6, global_last: bool = True):
+    """Helper for long-context stage: Gemma-style interleave with 1 global layer
+    every `ratio` layers (i.e. 5:1 local:global when ratio=6) and a forced
+    global last layer. NOT used during pretraining."""
+    types = ["sliding"] * n_layers
+    for i in range(ratio - 1, n_layers, ratio):
+        types[i] = "full"
+    if global_last:
+        types[-1] = "full"
+    return types
 
 
 class RMSNorm(nn.Module):
@@ -54,30 +92,62 @@ def apply_rope(x, cos, sin):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_type: str = "full"):
         super().__init__()
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_kv_heads
         self.head_dim = args.dim // args.n_heads
         self.rep = self.n_heads // self.n_kv_heads
+        self.layer_type = layer_type
+        self.sliding_window = args.sliding_window
         self.wq = nn.Linear(args.dim, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * self.head_dim, args.dim, bias=False)
+        # QK-Norm: RMSNorm over head_dim, applied per head to Q and K.
+        self.qk_norm = args.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, args.norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
 
     def forward(self, x, cos, sin):
         B, T, _ = x.shape
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         if self.rep > 1:
             k = k.repeat_interleave(self.rep, dim=1)
             v = v.repeat_interleave(self.rep, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.layer_type == "sliding" and self.sliding_window > 0:
+            # local causal window: token t attends to (t-window, t].
+            attn_mask = _sliding_causal_mask(T, self.sliding_window, x.device)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
+
+
+_mask_cache = {}
+
+
+def _sliding_causal_mask(T, window, device):
+    """Boolean additive mask (True=keep) for a causal sliding window.
+    Cached per (T, window, device)."""
+    key = (T, window, str(device))
+    m = _mask_cache.get(key)
+    if m is None:
+        i = torch.arange(T, device=device).view(T, 1)
+        j = torch.arange(T, device=device).view(1, T)
+        keep = (j <= i) & (j > i - window)     # causal AND within window
+        m = keep.view(1, 1, T, T)
+        _mask_cache[key] = m
+    return m
 
 
 class SwiGLU(nn.Module):
@@ -92,10 +162,10 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_type: str = "full"):
         super().__init__()
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
-        self.attn = Attention(args)
+        self.attn = Attention(args, layer_type=layer_type)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         self.ffn = SwiGLU(args.dim, args.ffn_hidden)
 
@@ -105,12 +175,13 @@ class Block(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
+class Chimera(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        types = args.resolved_layer_types()
         self.tok_emb = nn.Embedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList([Block(args) for _ in range(args.n_layers)])
+        self.layers = nn.ModuleList([Block(args, layer_type=t) for t in types])
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.lm_head = nn.Linear(args.dim, args.vocab_size, bias=False)
         if args.tie_embeddings:
@@ -148,3 +219,7 @@ class Transformer(nn.Module):
         # parameters() already de-duplicates shared tensors, so a tied
         # lm_head/tok_emb weight is counted exactly once.
         return sum(p.numel() for p in self.parameters())
+
+
+# Backwards-compat alias (older code / checkpoints referenced "Transformer").
+Transformer = Chimera

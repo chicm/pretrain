@@ -126,6 +126,21 @@
 
 **新兴可选（先只在 proxy 消融，别用于正式跑）**：KV sharing、hyper-connections 等 2026 上半年架构改进，收益仍在验证。
 
+### 3.1 本项目最终架构决策：**Chimera**
+
+模型代号 **Chimera**（`Chimera-tiny` / `Chimera-1B` / `Chimera-8B`）。取"奇美拉/混合体"之意——Qwen3 底座 + Gemma 长上下文能力的混血，且不蹭 Qwen/Gemma 商标。定型如下：
+
+| 决策 | 结论 | 说明 |
+|---|---|---|
+| **底座** | Qwen3-8B dense | dim 4096 / 32 层 / 32 Q-head / 8 KV-head（GQA 4:1）/ SwiGLU 14336 / RoPE / RMSNorm(Pre-Norm) / 无 bias |
+| **tokenizer** | Qwen3（vocab_size **151936**） | 151669 向上取整到 128 倍数；中英文+代码友好 |
+| **QK-Norm** | ✅ **默认开** | 对 per-head Q/K 做 RMSNorm，稳训练、抑制 loss spike；成本极低。Qwen3 本身即用，非"抄 Gemma" |
+| **混合滑窗注意力** | 🔧 **架构预留，预训练默认关闭** | 实现为可配置 `layer_types`（full/sliding）+ `sliding_window`。预训练 4K–8K 全用 full attention（贴近 Qwen3 已验证配置，降低翻车风险）；等长上下文扩展（32K+）阶段再开 Gemma 式 **5:1 local:global 交错 + 末层强制 global**（`make_gemma_layer_types()`）。窗口小于等于 0 时强制全 full，安全兜底 |
+| **GQA 比例** | 统一用 Qwen3 原生比例 | **不**搞局部层/全局层异构 GQA（那是未经大规模验证的"发挥"，KISS 原则） |
+| **Logit/attn soft-capping** | ❌ **不上** | Gemma3 起已被 QK-Norm 替代，且与 FlashAttention/SDPA 兼容差（fallback 慢路径）。既已上 QK-Norm，soft-capping 纯属累赘 |
+
+**核心哲学**：预训练（最烧钱、最不容错）阶段尽量贴近 Qwen3 已验证配置；把 Gemma 最值钱的一点（长上下文效率）做成**可插拔架构预留**，等 base 训好、进入长上下文扩展阶段再启用。既拿到收益，又不在预训练引入未验证改动。
+
 ---
 
 ## 4. 数据集（决定质量的头号因素）
