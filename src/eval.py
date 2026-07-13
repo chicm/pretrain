@@ -236,6 +236,7 @@ def make_lm_class():
                 results.append((total,))
             return results
 
+        @torch.no_grad()
         def generate_until(self, requests, disable_tqdm=False):
             """Greedy autoregressive generation for code tasks (HumanEval/MBPP).
 
