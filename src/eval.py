@@ -237,9 +237,56 @@ def make_lm_class():
             return results
 
         def generate_until(self, requests, disable_tqdm=False):
-            raise NotImplementedError(
-                "generate_until is not needed for the base-model likelihood "
-                "tasks; add a generation path if you want free-form eval.")
+            """Greedy autoregressive generation for code tasks (HumanEval/MBPP).
+
+            Each request: (context_str, gen_kwargs_dict). gen_kwargs may carry
+            'until' (list of stop strings) and 'max_gen_toks'. We generate
+            greedily token-by-token and cut at the first stop string.
+            """
+            from tqdm import tqdm
+            results = []
+            for req in tqdm(requests, disable=disable_tqdm, desc="generate_until"):
+                context, gen_kwargs = req.args
+                gen_kwargs = dict(gen_kwargs or {})
+                until = gen_kwargs.get("until", None)
+                if isinstance(until, str):
+                    until = [until]
+                if not until:
+                    until = ["<|endoftext|>"]
+                max_gen = int(gen_kwargs.get("max_gen_toks", 512))
+
+                ctx_ids = self.tok_encode(context)
+                # leave room for generation within max_length
+                if len(ctx_ids) > self.max_length - max_gen:
+                    ctx_ids = ctx_ids[-(self.max_length - max_gen):]
+                ids = list(ctx_ids)
+                gen_ids = []
+                text = ""
+                for _ in range(max_gen):
+                    inp = torch.tensor([ids[-self.max_length:]],
+                                       dtype=torch.long, device=self._device)
+                    with torch.autocast(
+                            device_type=self._device.split(":")[0],
+                            dtype=self.dtype):
+                        logits, _ = self.model(inp)
+                    next_id = int(logits[0, -1].float().argmax().item())
+                    if next_id == self.prefix_id:
+                        break
+                    ids.append(next_id)
+                    gen_ids.append(next_id)
+                    text = self.tok_decode(gen_ids)
+                    # stop if any 'until' string appeared
+                    cut = None
+                    for st in until:
+                        pos = text.find(st)
+                        if pos != -1:
+                            cut = pos if cut is None else min(cut, pos)
+                    if cut is not None:
+                        text = text[:cut]
+                        break
+                results.append(text)
+            return results
+
 
     return ChimeraLM
 
@@ -264,6 +311,10 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--output_dir", default=None,
                     help="write results json here (default: <ckpt_dir>/eval)")
+    ap.add_argument("--output_suffix", default="",
+                    help="suffix appended to result json filename (avoid overwrite)")
+    ap.add_argument("--confirm_run_unsafe_code", action="store_true",
+                    help="allow executing model-generated code (HumanEval/MBPP need this)")
     args = ap.parse_args()
 
     tasks = [t for t in args.tasks.split(",") if t]
@@ -299,6 +350,7 @@ def main():
         limit=args.limit,
         batch_size=args.batch_size,
         bootstrap_iters=1000,
+        confirm_run_unsafe_code=args.confirm_run_unsafe_code,
     )
 
     # --- print + save ---
@@ -314,7 +366,7 @@ def main():
         os.path.dirname(os.path.abspath(args.ckpt)), "eval")
     os.makedirs(out_dir, exist_ok=True)
     ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
-    out_path = os.path.join(out_dir, f"eval_{ckpt_name}.json")
+    out_path = os.path.join(out_dir, f"eval_{ckpt_name}{args.output_suffix}.json")
     with open(out_path, "w") as f:
         json.dump({"ckpt": args.ckpt, "step": step, "tasks": tasks,
                    "results": table, "config": {"model": cfg.get("model"),
