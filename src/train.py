@@ -251,6 +251,15 @@ def main():
     skipped_steps = 0
     if args.resume:
         step = load_ckpt(model, opt, args.resume)
+    # Deterministic GC: disable automatic collection and instead run a light
+    # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
+    # one rank from stalling the whole world at the next all-gather (straggler).
+    # (Borrowed from OLMo train.py.) gc_collect_interval steps between collects.
+    import gc
+    gc.collect()
+    gc.disable()
+    gc_interval = getattr(cfg, "gc_collect_interval", 1000)
+    log(f"[gc] automatic GC disabled; manual gc.collect(1) every {gc_interval} steps")
     t0 = time.time()
     tokens_per_step = cfg.micro_bsz * cfg.grad_accum * world * cfg.block_size
     data_iter = iter(loader)
@@ -316,6 +325,8 @@ def main():
         if step > 0 and step % cfg.ckpt_every == 0:
             save_ckpt(model, opt, step, cfg)
         step += 1
+        if step % gc_interval == 0:
+            gc.collect(1)   # light gen-1 collect, synchronized across all ranks
 
     save_ckpt(model, opt, step, cfg)
     if writer is not None:

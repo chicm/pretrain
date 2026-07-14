@@ -16,10 +16,10 @@ BRANCH=${BRANCH:-dev-chicm}
 DATA=${DATA:-$SHARED/data/tinystories_tok}
 OUT=${OUT:-$SHARED/checkpoints/mn_1b}
 MAX_STEPS=${MAX_STEPS:-500}
-MICRO_BSZ=${MICRO_BSZ:-3}
+MICRO_BSZ=${MICRO_BSZ:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-8}
 MODEL=${MODEL:-1b}
-EXTRA_ARGS=${EXTRA_ARGS:-}   # e.g. "--activation_checkpoint"
+EXTRA_ARGS=${EXTRA_ARGS:---fused_ce}   # default: fused CE (flash-attn Triton). e.g. add "--activation_checkpoint"
 COMPILE_FLAG=${COMPILE_FLAG:-}   # default ON (empty = torch.compile enabled); set COMPILE_FLAG="--no_compile" to disable
 RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs

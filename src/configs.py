@@ -50,6 +50,7 @@ class TrainConfig:
     eval_every: int = 500
     eval_batches: int = 50       # how many val batches to average per eval
     ckpt_every: int = 2000
+    gc_collect_interval: int = 1000       # manual gc.collect(1) cadence (auto-GC disabled)
     dtype: str = "bfloat16"
     compile: bool = True
     activation_checkpoint: bool = False   # per-Block non-reentrant AC (saves activation mem)
