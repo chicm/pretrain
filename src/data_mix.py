@@ -11,7 +11,7 @@ Or pass an inline JSON:  --data_mix '{"dclm":0.39,"fineweb_edu":0.26}'
 # maps source key -> tokenized directory suffix
 SOURCE_DIRS = {
     "dclm":        "dclm_tok",
-    "fineweb_edu": "fineweb_edu_100bt_tok",   # existing 100BT set (+ increments)
+    "fineweb_edu": "fineweb_edu_240bt_tok",   # fresh 240B tokenization for 1T mix
     "finepdfs":    "finepdfs_edu_tok",
     "code":        "code_tok",                # codeparrot-clean (Python, non-gated)
     "math":        "math_tok",                # finemath-3plus + open-web-math
