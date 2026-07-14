@@ -20,7 +20,31 @@ from torch.utils.data import Dataset, IterableDataset
 # ----------------------------------------------------------------------------
 def read_index(src_dir):
     """Load a source directory's index.json (or synthesize one from *.bin +
-    a legacy single train.bin/meta.json)."""
+    a legacy single train.bin/meta.json). Also merges parallel-worker
+    subdirectories part_*/ (each with its own index.json) into one view;
+    shard 'path' entries are made relative to src_dir."""
+    # merged multi-part layout: src_dir/part_K/index.json
+    parts = sorted(glob.glob(os.path.join(src_dir, "part_*")))
+    part_idx = [p for p in parts
+                if os.path.exists(os.path.join(p, "index.json"))]
+    if part_idx:
+        merged = None
+        shards = []
+        for p in part_idx:
+            with open(os.path.join(p, "index.json")) as f:
+                pi = json.load(f)
+            if merged is None:
+                merged = {k: pi.get(k) for k in
+                          ("dtype", "eot", "vocab_size")}
+                merged["total_tokens"] = 0
+            base = os.path.basename(p)
+            for sh in pi["shards"]:
+                shards.append({"path": os.path.join(base, sh["path"]),
+                               "tokens": sh.get("tokens")})
+            merged["total_tokens"] += pi.get("total_tokens", 0) or 0
+        merged["shards"] = shards
+        return merged
+
     idx_path = os.path.join(src_dir, "index.json")
     if os.path.exists(idx_path):
         with open(idx_path) as f:
@@ -215,17 +239,47 @@ def prepare_data(dataset_name, out_dir, tokenizer, split="train",
     return meta
 
 
+def _config_prefix(dataset_name, hf_config):
+    """Best-effort mapping from (dataset, config) -> parquet path prefix, so we
+    can list & partition just this config's files across parallel workers."""
+    if dataset_name == "HuggingFaceFW/fineweb-edu" and hf_config:
+        # sample-350BT -> sample/350BT/
+        if hf_config.startswith("sample-"):
+            return "sample/" + hf_config[len("sample-"):] + "/"
+    if dataset_name == "HuggingFaceTB/finemath" and hf_config:
+        return hf_config + "/"          # finemath-3plus/
+    # dclm / finephrase / finepdfs-edu: single default config, use all parquet
+    return None
+
+
+def list_config_files(dataset_name, hf_config):
+    """Return sorted list of parquet file paths for this dataset+config."""
+    from huggingface_hub import HfApi
+    api = HfApi()
+    files = [f for f in api.list_repo_files(dataset_name, repo_type="dataset")
+             if f.endswith(".parquet")]
+    pref = _config_prefix(dataset_name, hf_config)
+    if pref:
+        files = [f for f in files if f.startswith(pref)]
+    return sorted(files)
+
+
 def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
                          text_key="text", hf_config=None,
                          eot_id=None, shard_tokens=1_000_000_000,
                          target_tokens=None, num_proc=32, data_files=None,
-                         streaming=True):
+                         streaming=True, file_shards=1, file_shard_id=0):
     """Streaming, resumable, sharded tokenizer for very large sources (1T corpus).
 
     Writes shard_XXXX.bin (uint16/uint32) of ~shard_tokens each + index.json.
     Resumable: on restart, completed shards in index.json are kept and we skip
     ahead by their token count (approximate doc-level skip via HF streaming).
     Stops when target_tokens reached (or dataset exhausted).
+
+    Parallelism: when file_shards>1, only this worker's slice (file_shard_id of
+    file_shards) of the dataset's parquet files is processed. Each worker should
+    use a distinct out_dir (e.g. <dir>/part_K). Resume-by-skip then only skips
+    within this worker's own file subset, which is correct.
     """
     from datasets import load_dataset
     os.makedirs(out_dir, exist_ok=True)
@@ -233,6 +287,7 @@ def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
         eot_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
     dtype = np.uint16 if tokenizer.vocab_size < 65536 else np.uint32
     idx_path = os.path.join(out_dir, "index.json")
+
 
     # load / init index for resume
     if os.path.exists(idx_path):
@@ -251,10 +306,21 @@ def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
         print("[shard] target already reached; nothing to do.")
         return index
 
-    load_kwargs = dict(name=hf_config, split=split, streaming=streaming)
-    if data_files is not None:
-        load_kwargs["data_files"] = data_files
-    ds = load_dataset(dataset_name, **load_kwargs)
+    load_kwargs = dict(split=split, streaming=streaming)
+    if file_shards > 1:
+        # partition this config's parquet files across workers
+        all_files = list_config_files(dataset_name, hf_config)
+        my_files = all_files[file_shard_id::file_shards]
+        print(f"[shard] file-shard {file_shard_id}/{file_shards}: "
+              f"{len(my_files)}/{len(all_files)} parquet files", flush=True)
+        load_kwargs["data_files"] = my_files
+        ds = load_dataset(dataset_name, data_files=my_files, split=split,
+                          streaming=streaming)
+    else:
+        load_kwargs["name"] = hf_config
+        if data_files is not None:
+            load_kwargs["data_files"] = data_files
+        ds = load_dataset(dataset_name, **load_kwargs)
 
     def save_index():
         with open(idx_path, "w") as f:

@@ -59,7 +59,8 @@ def resolve_mix(name_or_json, data_root):
         import glob
         has = (os.path.exists(os.path.join(d, "index.json")) or
                os.path.exists(os.path.join(d, "train.bin")) or
-               glob.glob(os.path.join(d, "shard_*.bin")))
+               glob.glob(os.path.join(d, "shard_*.bin")) or
+               glob.glob(os.path.join(d, "part_*", "index.json")))
         if has:
             out[d] = w
         else:
