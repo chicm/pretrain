@@ -13,22 +13,21 @@ SOURCE_DIRS = {
     "dclm":        "dclm_tok",
     "fineweb_edu": "fineweb_edu_240bt_tok",   # fresh 240B tokenization for 1T mix
     "finepdfs":    "finepdfs_edu_tok",
-    "code":        "code_tok",                # codeparrot-clean (Python, non-gated)
-    "math":        "math_tok",                # finemath-3plus + open-web-math
+    "code":        "starcoder_tok",           # bigcode/starcoderdata (gated, token)
+    "math":        "math_tok",                # finemath-3plus
     "finephrase":  "finephrase_tok",
 }
 
-# 1T target mix (see docs/data_scaling_1T_design.md §2, revised for non-gated sources).
-# NOTE: bigcode/StarCoder code sets are HF-gated and no token is available on the
-# cluster, so code is limited to codeparrot-clean (Python). If a token is later
-# provided, swap in the-stack-v2 and raise the code share.
+# 1T target mix (see docs/data_scaling_1T_design.md §2).
+# User-approved final mix (plan B): web(dclm+fineweb+finepdfs)=55%, synthetic=20%,
+# code=15%, math=10%.
 MIX_1T = {
-    "dclm":        0.42,   # 420B  high-quality web (CC-BY)
-    "fineweb_edu": 0.24,   # 240B  educational web (ODC-By)
-    "finepdfs":    0.08,   #  80B  PDF-sourced (ODC-By), quality >= Nemotron-CC-v2
-    "math":        0.12,   # 120B  finemath-3plus + open-web-math
-    "code":        0.04,   #  40B  codeparrot-clean Python (non-gated)
-    "finephrase":  0.10,   # 100B  synthetic rewrite (ODC-By)
+    "dclm":        0.32,   # 320B  high-quality web (CC-BY)
+    "fineweb_edu": 0.18,   # 180B  educational web (ODC-By)
+    "finepdfs":    0.05,   #  50B  PDF-sourced (ODC-By)
+    "finephrase":  0.20,   # 200B  synthetic rewrite (ODC-By)
+    "code":        0.15,   # 150B  starcoderdata multi-lang (HF token)
+    "math":        0.10,   # 100B  finemath-3plus
 }
 
 
