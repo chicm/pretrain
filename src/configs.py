@@ -52,6 +52,7 @@ class TrainConfig:
     ckpt_every: int = 2000
     dtype: str = "bfloat16"
     compile: bool = True
+    activation_checkpoint: bool = False   # per-Block non-reentrant AC (saves activation mem)
     seed: int = 1337
     # --- observability ---
     tensorboard: bool = True     # write TB event files to <out_dir>/tb

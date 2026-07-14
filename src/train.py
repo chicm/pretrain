@@ -14,8 +14,12 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing,
+)
 
 from model import Transformer
+from model import Block as TransformerBlock
 from data import PackedDataset
 from configs import MODELS, TrainConfig
 
@@ -101,6 +105,8 @@ def main():
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
     ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--activation_checkpoint", action="store_true",
+                    help="enable per-Block non-reentrant activation checkpointing")
     ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
     args = ap.parse_args()
 
@@ -111,6 +117,8 @@ def main():
             setattr(cfg, k, v)
     if args.no_compile:
         cfg.compile = False
+    if args.activation_checkpoint:
+        cfg.activation_checkpoint = True
 
     # Per-model training-stability overrides. Larger/deeper models need a
     # smaller peak LR and longer warmup to stay numerically stable in bf16.
@@ -149,6 +157,13 @@ def main():
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    # Activation checkpointing: wrap each Block (non-reentrant) BEFORE sharding.
+    # Trades recompute for a large drop in activation memory -> enables bigger micro_bsz.
+    if cfg.activation_checkpoint:
+        for i, layer in enumerate(model.layers):
+            model.layers[i] = checkpoint_wrapper(
+                layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+        log(f"[ac] activation checkpointing ON for {len(model.layers)} blocks")
     for layer in model.layers:
         fully_shard(layer, mp_policy=mp)
     fully_shard(model, mp_policy=mp)
