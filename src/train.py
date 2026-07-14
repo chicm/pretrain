@@ -108,6 +108,8 @@ def main():
     ap.add_argument("--activation_checkpoint", action="store_true",
                     help="enable per-Block non-reentrant activation checkpointing")
     ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
+    ap.add_argument("--reduce_bf16", action="store_true",
+                    help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
     args = ap.parse_args()
 
     cfg = TrainConfig()
@@ -156,7 +158,9 @@ def main():
     model = Transformer(margs).to("cuda")
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
-    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
+    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
+    log(f"[precision] param_dtype=bf16 reduce_dtype={'bf16' if reduce_dtype==torch.bfloat16 else 'fp32'}")
     # Activation checkpointing: wrap each Block (non-reentrant) BEFORE sharding.
     # Trades recompute for a large drop in activation memory -> enables bigger micro_bsz.
     if cfg.activation_checkpoint:
