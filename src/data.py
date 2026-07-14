@@ -253,7 +253,50 @@ def _config_prefix(dataset_name, hf_config):
 
 
 def list_config_files(dataset_name, hf_config):
-    """Return sorted list of parquet file paths for this dataset+config."""
+    """Return sorted list of parquet file paths for this dataset+config.
+
+    Caches the (expensive) list_repo_files enumeration to a shared-disk JSON so
+    that many parallel file-shard workers don't each hammer the HF API (a repo
+    like dclm has ~28k files -> ~280 paginated requests per enumeration; N
+    workers * retries trivially exceeds the 1000-req/5min quota). First worker
+    populates the cache; the rest read it with zero API calls.
+    """
+    import os, json, hashlib, time
+    pref_key = f"{dataset_name}::{hf_config}"
+    cache_dir = os.environ.get("FILELIST_CACHE_DIR", "/tmp")
+    os.makedirs(cache_dir, exist_ok=True)
+    h = hashlib.md5(pref_key.encode()).hexdigest()[:16]
+    cache_path = os.path.join(cache_dir, f"filelist_{h}.json")
+    # fast path: valid cache
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as fh:
+                data = json.load(fh)
+            if data.get("key") == pref_key and data.get("files"):
+                return data["files"]
+        except Exception:
+            pass
+    # lock so only one worker enumerates; others wait for the cache file
+    lock_path = cache_path + ".lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        got_lock = True
+    except FileExistsError:
+        got_lock = False
+    if not got_lock:
+        # wait up to 10 min for the enumerating worker to publish the cache
+        for _ in range(600):
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path) as fh:
+                        data = json.load(fh)
+                    if data.get("key") == pref_key and data.get("files"):
+                        return data["files"]
+                except Exception:
+                    pass
+            time.sleep(1)
+        # fall through to enumerate ourselves as a last resort
     from huggingface_hub import HfApi
     api = HfApi()
     files = [f for f in api.list_repo_files(dataset_name, repo_type="dataset")
@@ -261,7 +304,22 @@ def list_config_files(dataset_name, hf_config):
     pref = _config_prefix(dataset_name, hf_config)
     if pref:
         files = [f for f in files if f.startswith(pref)]
-    return sorted(files)
+    files = sorted(files)
+    try:
+        tmp = cache_path + f".tmp{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump({"key": pref_key, "files": files}, fh)
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass
+    finally:
+        if got_lock:
+            try:
+                os.remove(lock_path)
+            except Exception:
+                pass
+    return files
+
 
 
 def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
