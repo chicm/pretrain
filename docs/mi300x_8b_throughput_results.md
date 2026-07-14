@@ -311,10 +311,23 @@ hipBLASLt），且省 ~14GB + 快 18%。
   变化，需由训练负责人决定是否设为默认。fused CE 与之前训练用的 vanilla CE 数值上非逐 bit 一致（但
   ln(V) 起点、收敛、gnorm 均已验证正常）。
 
-### 另一个可借鉴项（尚未实现）
+### mbsz 扫描：4 已达平台期
+fused CE 打开了更大 micro_bsz 的显存空间，遂扫描 mbsz=4/6（均 fused_ce + compile）：
+| mbsz | tok/s | vs mbsz=4 | 显存 | global batch | 判断 |
+|---|---|---|---|---|---|
+| **4（默认）** | **251.5K** | — | 106.5G (55%) | 4.2M | ✅ 最佳性价比 |
+| 6 | 254.8K | +1.3% | 156.3G (81%) | 6.3M | ❌ 不值 |
+- mbsz=6 仅 +1.3%：mbsz=4 时 GEMM 的 M 维（16384）已使 GPU 算术强度基本饱和，再增无益。
+- 代价：+50G 显存（余量收窄到 19%）、global batch 涨到 3× 基线、早期 gnorm 抬升（step 20 达 20）。
+- 结论：**维持 mbsz=4**。再次印证「计算瓶颈下算术强度一旦饱和（mbsz≥4）即无更多可挤」；fused CE 的
+  价值在于用省下的显存把 mbsz 从 3 推到饱和点 4，而非无限开大。
+
+### 另一个可借鉴项（已实现）
 OLMo 全程 `gc.disable()` + 每 N 步 `gc.collect(1)`：消除随机 full-GC 造成的单卡卡顿→全体 all-gather
-等待（straggler）。零精度风险、实现极简，主要收益是降低 step time 方差。world=32 是 straggler 敏感场景，
-建议后续加入。
+等待（straggler）。零精度风险、实现极简，主要收益是降低 step time 方差。world=32 是 straggler 敏感场景。
+**已实现**（commit `60c157e`）：`train.py` 循环前 `gc.disable()`，每 `gc_collect_interval`（默认 1000，
+configs.py 可调）步 `gc.collect(1)`。端到端 smoke 验证正常（`[gc] automatic GC disabled; manual
+gc.collect(1) every 1000 steps`）。
 
 ---
 
