@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing,
 )
@@ -110,6 +111,9 @@ def main():
     ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
+    ap.add_argument("--hsdp_shard", type=int, default=0,
+                    help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
+                         "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
     args = ap.parse_args()
 
     cfg = TrainConfig()
@@ -161,6 +165,19 @@ def main():
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
     log(f"[precision] param_dtype=bf16 reduce_dtype={'bf16' if reduce_dtype==torch.bfloat16 else 'fp32'}")
+    # HSDP: build a 2D device mesh (replicate, shard). shard group stays intra-node so
+    # param all-gather is limited to the fast intra-node fabric; cross-node does grad all-reduce.
+    fsdp_kw = {}
+    hsdp_shard = getattr(args, "hsdp_shard", 0)
+    if hsdp_shard and hsdp_shard > 0:
+        assert world % hsdp_shard == 0, f"world {world} not divisible by hsdp_shard {hsdp_shard}"
+        replicate = world // hsdp_shard
+        mesh = init_device_mesh("cuda", (replicate, hsdp_shard),
+                                mesh_dim_names=("replicate", "shard"))
+        fsdp_kw["mesh"] = mesh
+        log(f"[hsdp] 2D mesh replicate={replicate} x shard={hsdp_shard} (world={world})")
+    else:
+        log(f"[hsdp] full FSDP2 sharding (1D, world={world})")
     # Activation checkpointing: wrap each Block (non-reentrant) BEFORE sharding.
     # Trades recompute for a large drop in activation memory -> enables bigger micro_bsz.
     if cfg.activation_checkpoint:
@@ -169,8 +186,8 @@ def main():
                 layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
         log(f"[ac] activation checkpointing ON for {len(model.layers)} blocks")
     for layer in model.layers:
-        fully_shard(layer, mp_policy=mp)
-    fully_shard(model, mp_policy=mp)
+        fully_shard(layer, mp_policy=mp, **fsdp_kw)
+    fully_shard(model, mp_policy=mp, **fsdp_kw)
     if cfg.compile:
         model = torch.compile(model)
 
