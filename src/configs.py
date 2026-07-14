@@ -53,6 +53,7 @@ class TrainConfig:
     dtype: str = "bfloat16"
     compile: bool = True
     activation_checkpoint: bool = False   # per-Block non-reentrant AC (saves activation mem)
+    selective_ac: bool = False            # selective AC: save matmul/SDPA, recompute cheap ops
     seed: int = 1337
     # --- observability ---
     tensorboard: bool = True     # write TB event files to <out_dir>/tb

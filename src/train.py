@@ -18,6 +18,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing,
 )
+from torch.utils.checkpoint import (
+    create_selective_checkpoint_contexts, CheckpointPolicy,
+)
 
 from model import Transformer
 from model import Block as TransformerBlock
@@ -107,7 +110,10 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=None)
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--activation_checkpoint", action="store_true",
-                    help="enable per-Block non-reentrant activation checkpointing")
+                    help="enable per-Block non-reentrant activation checkpointing (full recompute)")
+    ap.add_argument("--selective_ac", action="store_true",
+                    help="selective activation checkpointing: save expensive matmul/SDPA outputs, "
+                         "recompute cheap elementwise/norm. Overrides --activation_checkpoint.")
     ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
@@ -125,6 +131,9 @@ def main():
         cfg.compile = False
     if args.activation_checkpoint:
         cfg.activation_checkpoint = True
+    cfg.selective_ac = bool(getattr(args, "selective_ac", False))
+    if cfg.selective_ac:
+        cfg.activation_checkpoint = True  # selective implies AC path
 
     # Per-model training-stability overrides. Larger/deeper models need a
     # smaller peak LR and longer warmup to stay numerically stable in bf16.
@@ -181,10 +190,34 @@ def main():
     # Activation checkpointing: wrap each Block (non-reentrant) BEFORE sharding.
     # Trades recompute for a large drop in activation memory -> enables bigger micro_bsz.
     if cfg.activation_checkpoint:
-        for i, layer in enumerate(model.layers):
-            model.layers[i] = checkpoint_wrapper(
-                layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-        log(f"[ac] activation checkpointing ON for {len(model.layers)} blocks")
+        if getattr(cfg, "selective_ac", False):
+            # Selective AC: SAVE expensive ops (matmul/addmm/SDPA) so they are NOT recomputed;
+            # recompute the cheap elementwise/norm/RoPE. Best throughput/memory balance.
+            _save_ops = {
+                torch.ops.aten.mm.default,
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.bmm.default,
+                torch.ops.aten._scaled_dot_product_flash_attention.default,
+                torch.ops.aten._scaled_dot_product_efficient_attention.default,
+                torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+            }
+            def _sac_policy(ctx, op, *a, **k):
+                return (CheckpointPolicy.MUST_SAVE if op in _save_ops
+                        else CheckpointPolicy.PREFER_RECOMPUTE)
+            def _ctx_fn():
+                return create_selective_checkpoint_contexts(_sac_policy)
+            for i, layer in enumerate(model.layers):
+                model.layers[i] = checkpoint_wrapper(
+                    layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    preserve_rng_state=False, context_fn=_ctx_fn)
+            log(f"[ac] SELECTIVE activation checkpointing ON for {len(model.layers)} blocks "
+                f"(save matmul/SDPA, recompute elementwise)")
+        else:
+            for i, layer in enumerate(model.layers):
+                model.layers[i] = checkpoint_wrapper(
+                    layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    preserve_rng_state=False)
+            log(f"[ac] FULL activation checkpointing ON for {len(model.layers)} blocks")
     for layer in model.layers:
         fully_shard(layer, mp_policy=mp, **fsdp_kw)
     fully_shard(model, mp_policy=mp, **fsdp_kw)
