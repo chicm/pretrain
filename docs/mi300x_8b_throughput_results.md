@@ -4,6 +4,14 @@
 **8B Chimera / MI300X ×32（4 节点 × 8 GPU，Infiniband 互联）** 上逐项 A/B 实测的完整过程、原始
 数据与分析结论。
 
+## TL;DR 最优配置
+**fused CE (`--fused_ce`) + micro_bsz=4 + torch.compile ON + fp32-reduce + 1D-FSDP2 → 250.8K tok/s
+（较基线 189K +33%）。** 借鉴 OLMo 的 fused cross-entropy 是迄今最大的单笔收益（见 §7.5）；其次优为
+no-AC + micro_bsz=3 + compile（202K, +6.9%）。是否将 fused-CE/mbsz=4 设为默认由训练负责人决定
+（涉及 global batch 2.1M→4.2M 超参变化）。
+
+---
+
 ---
 
 ## 0. 实验环境与方法
@@ -253,13 +261,71 @@ FP8 是**唯一直接攻击 GEMM 计算瓶颈**的方向（MI300X 硬件支持 F
 
 ---
 
+## 7.5 Fused Cross-Entropy（借鉴 OLMo，★迄今最大收益 +24%）✅ 已实现（默认待定）
+
+### 动机（来自 OLMo train.py 借鉴）
+审阅 AllenAI OLMo 的 `olmo/train.py` 加速手段后发现：其绝大多数手段我们已有或已测无收益
+（torch.compile / autocast bf16 / DDP no_sync / fused AdamW），**唯一我们没做、且可能有收益的是
+fused cross-entropy loss**（flash-attn 的 Triton kernel）。
+
+8B 的 vocab = 151936 极大。标准 `F.cross_entropy(logits.float(), labels)`（我们的精度底线用 fp32）
+要**物化整个 fp32 logits** `[mbsz×seq, 151936]` —— mbsz=3、seq=4096 时是 `12288×151936×4B ≈ 7.5GB`
+的中间张量，加 softmax 又一份，forward+backward 多次 HBM 往返。flash-attn Triton CE **在线计算 softmax、
+不物化完整 fp32 logits**，省显存又省带宽。
+
+### 微基准探路（`_ce_probe.py`，单 GPU，不碰训练代码）
+| 实现 | mbsz=3 时间/峰值显存 | mbsz=4 |
+|---|---|---|
+| vanilla `F.cross_entropy` | 115 ms / **22.1 GB** | 137 ms / 29.1 GB |
+| **flash-attn Triton CE** | **94 ms（−18%）/ 8.2 GB（省 13.9 GB）** | 107 ms / 10.6 GB |
+| Liger `LigerFusedLinearCrossEntropy` | 未安装（`No module named liger_kernel`） | — |
+
+API 语义用 `_ce_sig.py` 验证：`cross_entropy_loss(logits, labels)` 返回 per-token loss，uniform logits
+→ mean = 11.93 = ln(151936) ✓。**关键：flash-attn Triton CE 在 ROCm/MI300 上跑通了**（不像 FP8 撞
+hipBLASLt），且省 ~14GB + 快 18%。
+
+### 实现（commit `e93db71` → `186eb9d`）
+- `model.py` 新增 `_fused_ce_loss(logits, targets)`，调 `flash_attn.ops.triton.cross_entropy.cross_entropy_loss`，
+  保留 fp32 归约语义（kernel 内部 fp32）；`--fused_ce` flag 经 `model.fused_ce` 启用。
+- **关键坑**：torch.compile 会破坏 flash-attn 手写 Triton CE kernel → **loss 变成垃圾值 210**（应为
+  ln(V)≈12）。修复：给 `_fused_ce_loss` 加 **`@torch._dynamo.disable`**，让 compile 只编译 transformer
+  主体、绕过 CE kernel。加修复后 loss 恢复正常。
+
+### 原始数据（A/B，80 步 smoke）
+| 配置 | tok/s | vs 189K 基线 | 显存 | loss |
+|---|---|---|---|---|
+| 原始基线 mbsz=2 | 189K | — | 89G | ✓ |
+| 旧最优 mbsz=3 + compile | 202K | +6.9% | 131G | ✓ |
+| fused_ce mbsz=4 + no_compile | 210K | +11% | 150G | ✓ 12.76→10.26 |
+| fused_ce mbsz=4 + compile（无修复） | 250K（假象） | — | 110G | ❌ loss=210 |
+| **fused_ce mbsz=4 + compile（dynamo.disable 修复）** | **250.8K** | **+33%** | 106.5G | ✓ 12.76→9.36 |
+
+### 分析
+- **迄今最大单笔优化：250.8K tok/s，比旧最优（mbsz=3+compile 202K）快 +24%，比原始基线 +33%。**
+  loss 收敛正常、gnorm 正常、显存仅 106.5G（还有 ~85G 余量）。
+- **三重协同**：fused CE 省 ~14GB 显存 → **打开 mbsz=4**（此前 mbsz=4 差一点 OOM）；mbsz=4 提升算术
+  强度；compile 现可安全叠加（`torch._dynamo.disable` 绕过 Triton CE）。
+- **为何远大于此前七方向（都 1–7%）**：之前都是在计算瓶颈内部挤边际，fused CE **同时解除了显存约束
+  （得以开大 mbsz）与带宽约束（不物化 fp32 logits）**，是结构性突破而非边际优化。
+- **注意**：mbsz=4 使 global batch = 4×8×32×4096 ≈ 4.2M tokens/step（原基线 2.1M 的 2×），属训练超参
+  变化，需由训练负责人决定是否设为默认。fused CE 与之前训练用的 vanilla CE 数值上非逐 bit 一致（但
+  ln(V) 起点、收敛、gnorm 均已验证正常）。
+
+### 另一个可借鉴项（尚未实现）
+OLMo 全程 `gc.disable()` + 每 N 步 `gc.collect(1)`：消除随机 full-GC 造成的单卡卡顿→全体 all-gather
+等待（straggler）。零精度风险、实现极简，主要收益是降低 step time 方差。world=32 是 straggler 敏感场景，
+建议后续加入。
+
+---
+
 ## 8. 总结
 
-### 七方向 A/B 结果总表
+### 八方向 A/B 结果总表
 | 方向 | tok/s vs 189K | 显存 | 主要代价 | 采纳 |
 |---|---|---|---|---|
-| **micro_bsz=3** | **202K (+6.9%)** | 131G | global batch 1.5× | ✅ **最大收益** |
-| **torch.compile** | **191.2K (+1.2%)** | 89.3G | 首步编译 | ✅ 采纳 |
+| **★ fused CE + mbsz=4 + compile** | **250.8K (+33%)** | 106.5G | global batch 4.2M；需 dynamo.disable | ✅ **迄今最大收益** |
+| micro_bsz=3 | 202K (+6.9%) | 131G | global batch 1.5× | ✅（被 fused CE 取代为最优）|
+| torch.compile | 191.2K (+1.2%) | 89.3G | 首步编译 | ✅ 采纳 |
 | Selective AC, mbsz=6 | 196.4K (+4%) | 139G | 重算；仍<mbsz3；gnorm inf 风险 | ❌ 留 flag（最佳 AC）|
 | bf16-reduce | 191K (+1%) | 89.3G | 32-way bf16 求和精度险 | ❌ 留 flag |
 | HSDP shard=8×repl=4 | 189.8K (0%) | +11.4G/卡 | 无收益纯付显存 | ❌ 留 flag |
@@ -267,8 +333,9 @@ FP8 是**唯一直接攻击 GEMM 计算瓶颈**的方向（MI300X 硬件支持 F
 | FP8 (torchao) | 1.00× (零加速) | — | 软件栈未成熟 | ❌ 推迟 |
 
 ### 最优配置
-**no-AC + micro_bsz=3 + grad_accum=8 + fp32-reduce + 1D-FSDP2 + torch.compile ON → ~204K tok/s
-（较基线 189K +8%）。** 已固化为 `mi300_mn.sh` 默认（commit `1f773b1`）。
+**fused CE (`--fused_ce`) + micro_bsz=4 + torch.compile ON + fp32-reduce + 1D-FSDP2 → 250.8K tok/s
+（较基线 189K +33%，较此前次优 mbsz=3+compile +24%）。** loss 收敛正常、显存 106.5G。
+是否设为 `mi300_mn.sh` 默认由训练负责人决定（涉及 global batch 从 2.1M→4.2M 的超参变化）。
 
 ### 根因：8B 在 MI300×32（有 IB）是计算瓶颈
 GPU 满载 100%，主 FLOPs（matmul）跑在高效 rocBLAS/hipBLASLt 上，导致：
