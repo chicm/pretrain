@@ -20,6 +20,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch._dynamo.disable
+def _fused_ce_loss(logits, targets):
+    """flash-attn Triton fused cross-entropy. Kept out of the compile graph
+    (dynamo mis-handles the hand-written Triton kernel -> garbage loss)."""
+    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _fa_ce
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_tgt = targets.view(-1)
+    per_tok, _ = _fa_ce(flat_logits, flat_tgt, ignore_index=-100)
+    mask = flat_tgt != -100
+    return per_tok.sum() / mask.sum().clamp(min=1)
+
+
 @dataclass
 class ModelArgs:
     vocab_size: int = 151936
@@ -220,12 +232,9 @@ class Chimera(nn.Module):
                 # flash-attn Triton fused CE: online softmax, no fp32 logits
                 # materialization. ~14GB less peak mem at 8B vocab (enables bigger
                 # micro_bsz). Internally computes in fp32 -> preserves precision floor.
-                from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _fa_ce
-                flat_logits = logits.view(-1, logits.size(-1))
-                flat_tgt = targets.view(-1)
-                per_tok, _ = _fa_ce(flat_logits, flat_tgt, ignore_index=-100)
-                mask = flat_tgt != -100
-                loss = per_tok.sum() / mask.sum().clamp(min=1)
+                # NOTE: wrapped in compiler.disable — torch.compile mis-handles the
+                # hand-written Triton kernel (produced garbage loss ~210 otherwise).
+                loss = _fused_ce_loss(logits, targets)
             else:
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)).float(),
