@@ -19,26 +19,28 @@
 
 ---
 
-## 2. 数据配比（最终，授权友好池）
+## 2. 数据配比（最终，全非门控可访问源）
 
-严格限定 **ODC-By / CC-BY-4.0 / Apache-2.0** 授权，避开 Nemotron 系商用争议。
+> **重要现实修正**：集群无 HF token，`bigcode/the-stack-v2` / `starcoderdata` /
+> `the-stack-dedup` 全部 **HF-gated 无法访问**；`proof-pile-2` / `github-code` 为
+> 已废弃的 script-based dataset（datasets 库不再支持）。经 `_probe_sources` 系列
+> 实测，改用以下**全部非门控 + 授权友好**的确认可访问源。若日后提供 HF token，
+> 可换回 the-stack-v2 并提高 code 占比。
 
-| 类别 | 占比 | token | 数据源（HF dataset） | 授权 | 本地目录 |
+| 类别 | 占比 | token | 数据源（HF dataset，已实测 streaming OK） | 授权 | 本地目录 |
 |---|---|---|---|---|---|
-| **高质量 Web** | 65% | 650B | DCLM-baseline : FineWeb-Edu = 60:40 | CC-BY-4.0 / ODC-By | `dclm_tok/`, `fineweb_edu_tok/` |
-| **Code** | 15% | 150B | The Stack v2 (dedup) / StarCoderData | 宽松（license 过滤）| `stack_v2_tok/` |
-| **Math/Science** | 10% | 100B | FineMath + OpenWebMath + Proof-Pile-2 | 宽松 | `math_tok/` |
-| **合成改写** | 10% | 100B | FinePhrase (`HuggingFaceFW/finephrase`, 486B 池采 100B) | ODC-By | `finephrase_tok/` |
+| **高质量 Web** | 42% | 420B | `mlfoundations/dclm-baseline-1.0-parquet` | CC-BY-4.0 | `dclm_tok/` |
+| **教育 Web** | 24% | 240B | `HuggingFaceFW/fineweb-edu` (sample-350BT) | ODC-By | `fineweb_edu_240bt_tok/` |
+| **PDF 源** | 8% | 80B | `HuggingFaceFW/finepdfs-edu` | ODC-By | `finepdfs_edu_tok/` |
+| **Math** | 12% | 120B | `HuggingFaceTB/finemath` (finemath-3plus) | ODC-By | `math_tok/` |
+| **Code** | 4% | 40B | `codeparrot/codeparrot-clean` (Python, 非门控) | 宽松 | `code_tok/` |
+| **合成改写** | 10% | 100B | `HuggingFaceFW/finephrase` (all) | ODC-By | `finephrase_tok/` |
 | **合计** | 100% | **1000B** | | | |
 
-### 展开的每源 token 目标
-| 源 | 目标 token | 采样权重（loader）|
-|---|---|---|
-| DCLM-baseline | 390B | 0.39 |
-| FineWeb-Edu | 260B（已有 100B，补 160B）| 0.26 |
-| The Stack v2 / StarCoder | 150B | 0.15 |
-| Math (FineMath+OWM+ProofPile2) | 100B | 0.10 |
-| FinePhrase | 100B | 0.10 |
+> Code 占比从 15% 降到 4% 系门控所迫（仅 Python 单语言可用，多喂会过拟合单语言风格）；
+> 腾出的份额补到 DCLM/FineMath/FinePDFs（质量更高的可访问源）。HumanEval 提升目标改由
+> 后续 mid-training 阶段（可届时申请 token 引入 the-stack-v2）承接。
+
 
 ### 依据（均来自调研文档）
 - **DCLM 为主 web**：质量 > FineWeb-Edu（质量榜 §0.1），SmolLM2 实证 FineWeb-Edu:DCLM=40:60。
