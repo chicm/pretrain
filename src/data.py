@@ -261,39 +261,77 @@ def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
             json.dump(index, f, indent=2)
 
     # skip already-consumed docs approximately by token count
+    import time
     skip_tokens = done_tokens
     buf = []
     buf_len = 0
     total = done_tokens
     skipped = 0
+    ENC_BATCH = 1024          # docs encoded per fast-tokenizer call (GIL released)
+    t0 = time.time()
+    last_log = t0
+    since_log = 0
+
+    def encode_batch(texts):
+        out = tokenizer(texts, add_special_tokens=False)["input_ids"]
+        return out
+
+    txt_batch = []
+
+    def process_ids_list(ids_list):
+        nonlocal buf, buf_len, total, skipped, shard_id, since_log
+        for ids in ids_list:
+            ids.append(eot_id)
+            n = len(ids)
+            if skipped < skip_tokens:
+                skipped += n
+                continue
+            buf.append(np.asarray(ids, dtype=dtype))
+            buf_len += n
+            since_log += n
+            if buf_len >= shard_tokens:
+                arr = np.concatenate(buf)
+                cut = shard_tokens
+                path = f"shard_{shard_id:04d}.bin"
+                arr[:cut].tofile(os.path.join(out_dir, path))
+                index["shards"].append({"path": path, "tokens": int(cut)})
+                total += cut
+                index["total_tokens"] = int(total)
+                save_index()
+                print(f"[shard] wrote {path} ({cut:,} tok); total={total:,}", flush=True)
+                shard_id += 1
+                rem = arr[cut:]
+                buf = [rem] if len(rem) else []
+                buf_len = len(rem)
+                if target_tokens and total >= target_tokens:
+                    return True
+        return False
+
+    stop = False
     for ex in ds:
         txt = ex.get(text_key)
         if not txt:
             continue
-        ids = tokenizer(txt)["input_ids"]
-        ids.append(eot_id)
-        if skipped < skip_tokens:
-            skipped += len(ids)
-            continue
-        buf.append(np.asarray(ids, dtype=dtype))
-        buf_len += len(ids)
-        if buf_len >= shard_tokens:
-            arr = np.concatenate(buf)
-            # write exactly shard_tokens, carry remainder
-            cut = shard_tokens
-            path = f"shard_{shard_id:04d}.bin"
-            arr[:cut].tofile(os.path.join(out_dir, path))
-            index["shards"].append({"path": path, "tokens": int(cut)})
-            total += cut
-            index["total_tokens"] = int(total)
-            save_index()
-            print(f"[shard] wrote {path} ({cut:,} tok); total={total:,}")
-            shard_id += 1
-            rem = arr[cut:]
-            buf = [rem] if len(rem) else []
-            buf_len = len(rem)
-            if target_tokens and total >= target_tokens:
+        txt_batch.append(txt)
+        if len(txt_batch) >= ENC_BATCH:
+            if process_ids_list(encode_batch(txt_batch)):
+                stop = True
+            txt_batch = []
+            now = time.time()
+            if now - last_log >= 30:
+                rate = since_log / (now - last_log)
+                done_now = total + buf_len
+                eta_h = ((target_tokens - done_now) / rate / 3600
+                         if target_tokens and rate > 0 else -1)
+                print(f"[rate] {done_now:,} tok | {rate/1000:.1f}K tok/s | "
+                      f"eta {eta_h:.1f}h", flush=True)
+                last_log = now
+                since_log = 0
+            if stop:
                 break
+    if not stop and txt_batch:
+        process_ids_list(encode_batch(txt_batch))
+
     # final partial shard
     if buf_len > 0 and (not target_tokens or total < target_tokens):
         arr = np.concatenate(buf)
