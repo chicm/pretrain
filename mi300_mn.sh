@@ -20,6 +20,7 @@ MICRO_BSZ=${MICRO_BSZ:-8}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
 MODEL=${MODEL:-1b}
 EXTRA_ARGS=${EXTRA_ARGS:-}   # e.g. "--activation_checkpoint"
+COMPILE_FLAG=${COMPILE_FLAG:---no_compile}   # default off; set COMPILE_FLAG="" to enable torch.compile
 RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs
 mkdir -p "$OUT" "$LOGDIR"
@@ -40,7 +41,7 @@ for i in 0 1 2 3; do
     nohup torchrun --nnodes=4 --nproc_per_node=8 --node_rank=$i \
       --rdzv_id=$RDZV_ID --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
       train.py --model $MODEL --data_dir $DATA --out_dir $OUT \
-      --micro_bsz $MICRO_BSZ --grad_accum $GRAD_ACCUM --max_steps $MAX_STEPS --no_compile $EXTRA_ARGS \
+      --micro_bsz $MICRO_BSZ --grad_accum $GRAD_ACCUM --max_steps $MAX_STEPS $COMPILE_FLAG $EXTRA_ARGS \
       > $LOGDIR/mn_node${i}.log 2>&1 &
   " &
 done
