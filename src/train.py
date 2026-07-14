@@ -104,6 +104,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None)
     ap.add_argument("--data_dir", default=None)
+    ap.add_argument("--data_root", default=None,
+                    help="parent dir of per-source tokenized dirs (for --data_mix)")
+    ap.add_argument("--data_mix", default=None,
+                    help="named mix (mix_1t/smoke) or inline JSON of source->weight; "
+                         "enables multi-source weighted sampling (overrides --data_dir)")
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--max_steps", type=int, default=None)
     ap.add_argument("--micro_bsz", type=int, default=None)
@@ -151,24 +156,43 @@ def main():
     torch.manual_seed(cfg.seed)
 
     # --- data ---
-    meta = json.load(open(os.path.join(cfg.data_dir, "meta.json")))
     margs = MODELS[cfg.model]()
-    margs.vocab_size = max(margs.vocab_size, meta["vocab_size"])
     cfg.block_size = margs.max_seq_len
-    train_ds = PackedDataset(os.path.join(cfg.data_dir, "train.bin"),
-                             cfg.block_size, meta["dtype"])
-    sampler = DistributedSampler(train_ds, num_replicas=world,
-                                 rank=dist.get_rank(), shuffle=True)
-    loader = DataLoader(train_ds, batch_size=cfg.micro_bsz, sampler=sampler,
-                        num_workers=4, pin_memory=True, drop_last=True)
+    if getattr(args, "data_mix", None):
+        # multi-source weighted sampling (1T corpus)
+        from data import WeightedMultiSourceDataset, read_index
+        from data_mix import resolve_mix
+        data_root = args.data_root or cfg.data_dir
+        sources = resolve_mix(args.data_mix, data_root)
+        # derive vocab from first source's index
+        first_idx = read_index(list(sources.keys())[0])
+        if first_idx.get("vocab_size"):
+            margs.vocab_size = max(margs.vocab_size, first_idx["vocab_size"])
+        train_ds = WeightedMultiSourceDataset(
+            sources, cfg.block_size, seed=cfg.seed,
+            rank=dist.get_rank(), world=world)
+        loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
+                            num_workers=4, pin_memory=True, drop_last=True)
+        val_loader = None
+        log(f"[data] multi-source mix '{args.data_mix}': "
+            + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
+    else:
+        meta = json.load(open(os.path.join(cfg.data_dir, "meta.json")))
+        margs.vocab_size = max(margs.vocab_size, meta["vocab_size"])
+        train_ds = PackedDataset(os.path.join(cfg.data_dir, "train.bin"),
+                                 cfg.block_size, meta["dtype"])
+        sampler = DistributedSampler(train_ds, num_replicas=world,
+                                     rank=dist.get_rank(), shuffle=True)
+        loader = DataLoader(train_ds, batch_size=cfg.micro_bsz, sampler=sampler,
+                            num_workers=4, pin_memory=True, drop_last=True)
 
-    # optional val set (written by prepare_data when val_frac > 0)
-    val_loader = None
-    val_path = os.path.join(cfg.data_dir, "val.bin")
-    if os.path.exists(val_path):
-        val_ds = PackedDataset(val_path, cfg.block_size, meta["dtype"])
-        val_loader = DataLoader(val_ds, batch_size=cfg.micro_bsz, shuffle=False,
-                                num_workers=2, pin_memory=True, drop_last=True)
+        # optional val set (written by prepare_data when val_frac > 0)
+        val_loader = None
+        val_path = os.path.join(cfg.data_dir, "val.bin")
+        if os.path.exists(val_path):
+            val_ds = PackedDataset(val_path, cfg.block_size, meta["dtype"])
+            val_loader = DataLoader(val_ds, batch_size=cfg.micro_bsz, shuffle=False,
+                                    num_workers=2, pin_memory=True, drop_last=True)
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")

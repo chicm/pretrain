@@ -6,12 +6,125 @@ Two steps:
   2) PackedDataset: memory-maps the .bin and yields (x, y) blocks.
 """
 import os
+import json
+import glob
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
+
+
+# ----------------------------------------------------------------------------
+# Sharded tokenize output (for 1T multi-source corpus). Each source is written
+# as shard_XXXX.bin files + an index.json describing them, enabling resumable
+# tokenize and weighted multi-source sampling at train time.
+# ----------------------------------------------------------------------------
+def read_index(src_dir):
+    """Load a source directory's index.json (or synthesize one from *.bin +
+    a legacy single train.bin/meta.json)."""
+    idx_path = os.path.join(src_dir, "index.json")
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            return json.load(f)
+    # legacy fallback: a single train.bin + meta.json
+    meta_path = os.path.join(src_dir, "meta.json")
+    train_bin = os.path.join(src_dir, "train.bin")
+    if os.path.exists(train_bin) and os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        return {"dtype": meta["dtype"], "eot": meta.get("eot"),
+                "vocab_size": meta.get("vocab_size"),
+                "total_tokens": meta.get("total_tokens"),
+                "shards": [{"path": "train.bin",
+                            "tokens": meta.get("total_tokens")}]}
+    # last resort: glob shard_*.bin, assume uint32
+    shards = sorted(glob.glob(os.path.join(src_dir, "shard_*.bin")))
+    if not shards:
+        raise FileNotFoundError(f"no index.json / train.bin / shard_*.bin in {src_dir}")
+    return {"dtype": "uint32", "eot": None, "vocab_size": None,
+            "total_tokens": None,
+            "shards": [{"path": os.path.basename(s), "tokens": None} for s in shards]}
+
+
+class WeightedMultiSourceDataset(IterableDataset):
+    """Infinite iterable that samples fixed-length (x, y) blocks from multiple
+    tokenized sources according to per-source weights.
+
+    sources: dict {source_dir: weight}. Weights are normalized. Each step:
+      pick a source ~ weight, pick a shard ~ shard-token-count, read a random
+      contiguous block of (block_size+1) tokens from that shard's memmap.
+
+    DDP-aware: each rank uses a distinct RNG stream (seed + rank). Also splits
+    across DataLoader workers. Yields torch int64 (x, y) like PackedDataset.
+    """
+    def __init__(self, sources, block_size, seed=1337, rank=0, world=1,
+                 count_sources=False):
+        super().__init__()
+        self.block_size = block_size
+        self.seed = seed
+        self.rank = rank
+        self.world = world
+        self.count_sources = count_sources
+        self._counts = {}
+        # resolve each source: list of (memmap, n_blocks) + source weight
+        self.src_names = []
+        self.src_weights = []
+        self.src_shards = []   # per source: list of dict(mm, n_tokens)
+        self.src_shard_w = []  # per source: normalized shard weights (by tokens)
+        for src_dir, w in sources.items():
+            if w <= 0:
+                continue
+            idx = read_index(src_dir)
+            dtype = np.dtype(idx["dtype"])
+            shards = []
+            tok_counts = []
+            for sh in idx["shards"]:
+                p = os.path.join(src_dir, sh["path"])
+                mm = np.memmap(p, dtype=dtype, mode="r")
+                if len(mm) <= block_size + 1:
+                    continue
+                shards.append(mm)
+                tok_counts.append(len(mm))
+            if not shards:
+                continue
+            tok_counts = np.array(tok_counts, dtype=np.float64)
+            self.src_names.append(os.path.basename(src_dir.rstrip("/")))
+            self.src_weights.append(float(w))
+            self.src_shards.append(shards)
+            self.src_shard_w.append(tok_counts / tok_counts.sum())
+        if not self.src_shards:
+            raise ValueError("WeightedMultiSourceDataset: no usable sources")
+        sw = np.array(self.src_weights, dtype=np.float64)
+        self.src_weights = sw / sw.sum()
+
+    def source_counts(self):
+        return dict(self._counts)
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        worker_id = info.id if info else 0
+        num_workers = info.num_workers if info else 1
+        # unique stream per (rank, worker)
+        rng = np.random.default_rng(
+            self.seed + self.rank * 100003 + worker_id * 10007)
+        bs1 = self.block_size + 1
+        n_src = len(self.src_shards)
+        while True:
+            si = rng.choice(n_src, p=self.src_weights)
+            shards = self.src_shards[si]
+            shi = rng.choice(len(shards), p=self.src_shard_w[si])
+            mm = shards[shi]
+            start = int(rng.integers(0, len(mm) - bs1))
+            chunk = np.asarray(mm[start:start + bs1]).astype(np.int64)
+            if self.count_sources:
+                name = self.src_names[si]
+                self._counts[name] = self._counts.get(name, 0) + 1
+            x = torch.from_numpy(chunk[:-1])
+            y = torch.from_numpy(chunk[1:])
+            yield x, y
 
 
 def prepare_data(dataset_name, out_dir, tokenizer, split="train",
+
                  text_key="text", num_proc=32, val_frac=0.0005,
                  hf_config=None, streaming=False, max_docs=None, eot_id=None):
     """Tokenize a HF dataset into packed .bin files.
