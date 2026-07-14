@@ -30,6 +30,14 @@ def main():
     ap.add_argument("--num_proc", type=int, default=32)
     ap.add_argument("--streaming", action="store_true")
     ap.add_argument("--max_docs", type=int, default=None)
+    ap.add_argument("--sharded", action="store_true",
+                    help="streaming resumable sharded output (for 1T sources)")
+    ap.add_argument("--shard_tokens", type=int, default=1_000_000_000,
+                    help="tokens per shard (default 1B)")
+    ap.add_argument("--target_tokens", type=int, default=None,
+                    help="stop after this many tokens (per-source budget)")
+    ap.add_argument("--data_files", default=None,
+                    help="optional HF data_files glob/pattern")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -39,10 +47,18 @@ def main():
         eot_id = tok.eos_token_id if tok.eos_token_id is not None else 0
     print(f"[tokenize] tokenizer={args.tokenizer} vocab={tok.vocab_size} "
           f"eot='{args.eot_token}' id={eot_id}")
-    prepare_data(args.dataset, args.out, tok, split=args.split,
-                 text_key=args.text_key, num_proc=args.num_proc,
-                 hf_config=args.hf_config, streaming=args.streaming,
-                 max_docs=args.max_docs, eot_id=eot_id)
+    if args.sharded:
+        from data import prepare_data_sharded
+        prepare_data_sharded(
+            args.dataset, args.out, tok, split=args.split,
+            text_key=args.text_key, hf_config=args.hf_config, eot_id=eot_id,
+            shard_tokens=args.shard_tokens, target_tokens=args.target_tokens,
+            num_proc=args.num_proc, data_files=args.data_files, streaming=True)
+    else:
+        prepare_data(args.dataset, args.out, tok, split=args.split,
+                     text_key=args.text_key, num_proc=args.num_proc,
+                     hf_config=args.hf_config, streaming=args.streaming,
+                     max_docs=args.max_docs, eot_id=eot_id)
 
 
 if __name__ == "__main__":

@@ -215,6 +215,102 @@ def prepare_data(dataset_name, out_dir, tokenizer, split="train",
     return meta
 
 
+def prepare_data_sharded(dataset_name, out_dir, tokenizer, split="train",
+                         text_key="text", hf_config=None,
+                         eot_id=None, shard_tokens=1_000_000_000,
+                         target_tokens=None, num_proc=32, data_files=None,
+                         streaming=True):
+    """Streaming, resumable, sharded tokenizer for very large sources (1T corpus).
+
+    Writes shard_XXXX.bin (uint16/uint32) of ~shard_tokens each + index.json.
+    Resumable: on restart, completed shards in index.json are kept and we skip
+    ahead by their token count (approximate doc-level skip via HF streaming).
+    Stops when target_tokens reached (or dataset exhausted).
+    """
+    from datasets import load_dataset
+    os.makedirs(out_dir, exist_ok=True)
+    if eot_id is None:
+        eot_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    dtype = np.uint16 if tokenizer.vocab_size < 65536 else np.uint32
+    idx_path = os.path.join(out_dir, "index.json")
+
+    # load / init index for resume
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            index = json.load(f)
+    else:
+        index = {"dtype": np.dtype(dtype).name, "eot": int(eot_id),
+                 "vocab_size": int(tokenizer.vocab_size),
+                 "dataset": dataset_name, "hf_config": hf_config,
+                 "total_tokens": 0, "shards": []}
+    done_tokens = index.get("total_tokens", 0)
+    shard_id = len(index["shards"])
+    print(f"[shard] resume: {shard_id} shards, {done_tokens:,} tokens done; "
+          f"target={target_tokens}")
+    if target_tokens and done_tokens >= target_tokens:
+        print("[shard] target already reached; nothing to do.")
+        return index
+
+    load_kwargs = dict(name=hf_config, split=split, streaming=streaming)
+    if data_files is not None:
+        load_kwargs["data_files"] = data_files
+    ds = load_dataset(dataset_name, **load_kwargs)
+
+    def save_index():
+        with open(idx_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+    # skip already-consumed docs approximately by token count
+    skip_tokens = done_tokens
+    buf = []
+    buf_len = 0
+    total = done_tokens
+    skipped = 0
+    for ex in ds:
+        txt = ex.get(text_key)
+        if not txt:
+            continue
+        ids = tokenizer(txt)["input_ids"]
+        ids.append(eot_id)
+        if skipped < skip_tokens:
+            skipped += len(ids)
+            continue
+        buf.append(np.asarray(ids, dtype=dtype))
+        buf_len += len(ids)
+        if buf_len >= shard_tokens:
+            arr = np.concatenate(buf)
+            # write exactly shard_tokens, carry remainder
+            cut = shard_tokens
+            path = f"shard_{shard_id:04d}.bin"
+            arr[:cut].tofile(os.path.join(out_dir, path))
+            index["shards"].append({"path": path, "tokens": int(cut)})
+            total += cut
+            index["total_tokens"] = int(total)
+            save_index()
+            print(f"[shard] wrote {path} ({cut:,} tok); total={total:,}")
+            shard_id += 1
+            rem = arr[cut:]
+            buf = [rem] if len(rem) else []
+            buf_len = len(rem)
+            if target_tokens and total >= target_tokens:
+                break
+    # final partial shard
+    if buf_len > 0 and (not target_tokens or total < target_tokens):
+        arr = np.concatenate(buf)
+        if target_tokens:
+            arr = arr[:max(0, target_tokens - total)]
+        if len(arr):
+            path = f"shard_{shard_id:04d}.bin"
+            arr.tofile(os.path.join(out_dir, path))
+            index["shards"].append({"path": path, "tokens": int(len(arr))})
+            total += len(arr)
+            index["total_tokens"] = int(total)
+            save_index()
+            print(f"[shard] wrote final {path} ({len(arr):,} tok)")
+    print(f"[shard] DONE {out_dir}: {total:,} tokens in {len(index['shards'])} shards")
+    return index
+
+
 def _split_train_val(chunk, abs_start, n_train):
     """Route a token chunk (starting at absolute position abs_start) into
     train (positions < n_train) and val (>= n_train) segments."""
