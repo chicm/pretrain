@@ -120,6 +120,9 @@ def main():
     ap.add_argument("--hsdp_shard", type=int, default=0,
                     help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
                          "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
+    ap.add_argument("--fused_ce", action="store_true",
+                    help="use flash-attn Triton fused cross-entropy (online softmax, no fp32 "
+                         "logits materialization; ~14GB less peak mem at 8B vocab -> bigger micro_bsz)")
     args = ap.parse_args()
 
     cfg = TrainConfig()
@@ -169,6 +172,9 @@ def main():
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")
+    model.fused_ce = bool(getattr(args, "fused_ce", False))
+    if model.fused_ce:
+        log("[ce] flash-attn Triton fused cross-entropy ON")
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32

@@ -216,11 +216,22 @@ class Chimera(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)).float(),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+            if getattr(self, "fused_ce", False):
+                # flash-attn Triton fused CE: online softmax, no fp32 logits
+                # materialization. ~14GB less peak mem at 8B vocab (enables bigger
+                # micro_bsz). Internally computes in fp32 -> preserves precision floor.
+                from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _fa_ce
+                flat_logits = logits.view(-1, logits.size(-1))
+                flat_tgt = targets.view(-1)
+                per_tok, _ = _fa_ce(flat_logits, flat_tgt, ignore_index=-100)
+                mask = flat_tgt != -100
+                loss = per_tok.sum() / mask.sum().clamp(min=1)
+            else:
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)).float(),
+                    targets.view(-1),
+                    ignore_index=-100,
+                )
         return logits, loss
 
     def num_params(self):
