@@ -36,6 +36,7 @@ for i in 0 1 2 3; do
     source /opt/conda/etc/profile.d/conda.sh; conda activate $CONDA_ENV
     export HF_HOME=/scratch/hf_local OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
     export NCCL_DEBUG=WARN NCCL_SOCKET_IFNAME=eth0 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 PYTHONUNBUFFERED=1
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     nohup torchrun --nnodes=4 --nproc_per_node=8 --node_rank=$i \
       --rdzv_id=$RDZV_ID --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
       train.py --model $MODEL --data_dir $DATA --out_dir $OUT \
