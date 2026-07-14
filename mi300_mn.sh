@@ -16,11 +16,11 @@ BRANCH=${BRANCH:-dev-chicm}
 DATA=${DATA:-$SHARED/data/tinystories_tok}
 OUT=${OUT:-$SHARED/checkpoints/mn_1b}
 MAX_STEPS=${MAX_STEPS:-500}
-MICRO_BSZ=${MICRO_BSZ:-8}
-GRAD_ACCUM=${GRAD_ACCUM:-2}
+MICRO_BSZ=${MICRO_BSZ:-3}
+GRAD_ACCUM=${GRAD_ACCUM:-8}
 MODEL=${MODEL:-1b}
 EXTRA_ARGS=${EXTRA_ARGS:-}   # e.g. "--activation_checkpoint"
-COMPILE_FLAG=${COMPILE_FLAG:---no_compile}   # default off; set COMPILE_FLAG="" to enable torch.compile
+COMPILE_FLAG=${COMPILE_FLAG:-}   # default ON (empty = torch.compile enabled); set COMPILE_FLAG="--no_compile" to disable
 RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs
 mkdir -p "$OUT" "$LOGDIR"
