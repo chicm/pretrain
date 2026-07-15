@@ -110,8 +110,39 @@ def test_ddp_disjoint():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_resume_skip_no_repeat():
+    """A run that consumes K instances then resumes with resume_skip=K must
+    yield the SAME deterministic tail as one uninterrupted run — no re-training
+    of the first K instances, no gap. Uses 2 sources so the fast-forward has to
+    replay the interleaved selection stream, not just a single cursor.
+
+    NOTE: resume_skip is divided by num_workers inside __iter__; this single
+    -process test has num_workers=1, so skip==resume_skip exactly."""
+    tmp = tempfile.mkdtemp()
+    try:
+        make_source(tmp, "a", 500, tag=1)
+        make_source(tmp, "b", 500, tag=2)
+        srcs = {os.path.join(tmp, "a"): 0.6, os.path.join(tmp, "b"): 0.4}
+        # ground truth: one uninterrupted run of 200 draws
+        ref = draw(EpochMixtureDataset(srcs, BS, seed=5, rank=0, world=1), 200)
+        K = 80
+        # resumed run: fast-forward past first K, expect ref[K:200]
+        tail = draw(EpochMixtureDataset(srcs, BS, seed=5, rank=0, world=1,
+                                        resume_skip=K), 200 - K)
+        assert tail == ref[K:], (
+            f"resume tail mismatch at first diff "
+            f"{next(i for i in range(len(tail)) if tail[i] != ref[K + i])}")
+        # sanity: the skipped prefix is exactly ref[:K] and disjoint from tail's
+        # fresh ids is NOT required (epochs repeat), but no id from ref[:K] should
+        # reappear before its natural next epoch — verified implicitly by equality.
+        print(f"PASS resume_skip: tail of {200-K} draws matches uninterrupted run")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_coverage_no_repeat()
     test_weight_ratio()
     test_ddp_disjoint()
+    test_resume_skip_no_repeat()
     print("ALL TESTS PASSED")

@@ -179,13 +179,14 @@ class EpochMixtureDataset(IterableDataset):
     (<= a few MB per shard).
     """
     def __init__(self, sources, block_size, seed=1337, rank=0, world=1,
-                 count_sources=False):
+                 count_sources=False, resume_skip=0):
         super().__init__()
         self.block_size = block_size
         self.seed = seed
         self.rank = rank
         self.world = world
         self.count_sources = count_sources
+        self.resume_skip = int(resume_skip)
         self._counts = {}
         self.src_names = []
         self.src_weights = []
@@ -266,6 +267,10 @@ class EpochMixtureDataset(IterableDataset):
         bs1 = self.block_size + 1
         n_src = len(self.src_shards)
         active = list(range(n_src))
+        # deterministic fast-forward for resume: this replica's total skip is
+        # split evenly across its workers (main loop consumes round-robin).
+        skip = self.resume_skip // max(1, num_workers)
+        produced = 0
         while active:
             si = sel_rng.choice(n_src, p=self.src_weights)
             try:
@@ -281,6 +286,10 @@ class EpochMixtureDataset(IterableDataset):
                 mask[[i for i in range(n_src) if i not in active]] = False
                 w = np.where(mask, w, 0.0)
                 self.src_weights = w / w.sum()
+                continue
+            # fast-forward: advance the SAME deterministic stream but don't yield
+            if produced < skip:
+                produced += 1
                 continue
             chunk = np.asarray(mm[start:start + bs1]).astype(np.int64)
             if self.count_sources:

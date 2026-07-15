@@ -65,9 +65,60 @@ def save_ckpt(model, opt, step, cfg):
     if not is_master():
         return
     path = os.path.join(cfg.out_dir, f"ckpt_{step}.pt")
+    tmp = path + ".tmp"
     torch.save({"model": model_sd, "opt": opt_sd, "step": step,
-                "cfg": cfg.__dict__}, path)
+                "cfg": cfg.__dict__}, tmp)
+    os.replace(tmp, path)   # atomic: a crash mid-write never leaves a half ckpt
+    # write/refresh the "latest" pointer so --resume latest just works
+    with open(os.path.join(cfg.out_dir, "latest"), "w") as f:
+        f.write(f"ckpt_{step}.pt\n")
     log(f"[ckpt] saved {path}")
+    _prune_ckpts(cfg)
+
+
+def _prune_ckpts(cfg):
+    """Keep only the most recent cfg.keep_last_ckpts checkpoints on disk.
+    Each 8B full-state ckpt is huge (~180GB incl optimizer), so unbounded
+    saves would fill the disk over a 238K-step run. Master-only."""
+    keep = getattr(cfg, "keep_last_ckpts", 3)
+    if keep <= 0:
+        return
+    import glob, re
+    files = glob.glob(os.path.join(cfg.out_dir, "ckpt_*.pt"))
+    def _step_of(p):
+        m = re.search(r"ckpt_(\d+)\.pt$", p)
+        return int(m.group(1)) if m else -1
+    files = sorted(files, key=_step_of)
+    for p in files[:-keep]:
+        try:
+            os.remove(p)
+            log(f"[ckpt] pruned old {os.path.basename(p)}")
+        except OSError as e:
+            log(f"[ckpt] prune failed {p}: {e}")
+
+
+def resolve_resume_path(spec, out_dir):
+    """Map --resume value to a concrete ckpt path.
+      * 'latest'         -> read <out_dir>/latest pointer
+      * a bare filename  -> <out_dir>/<filename>
+      * an explicit path -> used as-is
+    Returns None if nothing to resume from (fresh start)."""
+    if not spec:
+        return None
+    if spec == "latest":
+        ptr = os.path.join(out_dir, "latest")
+        if not os.path.exists(ptr):
+            log(f"[ckpt] --resume latest but no '{ptr}' found -> starting fresh")
+            return None
+        name = open(ptr).read().strip()
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            log(f"[ckpt] latest points to missing {path} -> starting fresh")
+            return None
+        return path
+    if os.path.dirname(spec):
+        return spec
+    return os.path.join(out_dir, spec)
 
 
 def load_ckpt(model, opt, path):
@@ -119,7 +170,14 @@ def main():
     ap.add_argument("--selective_ac", action="store_true",
                     help="selective activation checkpointing: save expensive matmul/SDPA outputs, "
                          "recompute cheap elementwise/norm. Overrides --activation_checkpoint.")
-    ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint to resume from: 'latest' (auto from <out_dir>/latest), "
+                         "a bare filename (ckpt_5000.pt), or an explicit path. Restores "
+                         "model+opt+step and fast-forwards the data stream so no data is "
+                         "re-trained.")
+    ap.add_argument("--keep_last_ckpts", type=int, default=None,
+                    help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
+                         "0 = keep all. Prevents disk blow-up over long runs.")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
     ap.add_argument("--hsdp_shard", type=int, default=0,
@@ -146,6 +204,8 @@ def main():
         cfg.compile = False
     if args.activation_checkpoint:
         cfg.activation_checkpoint = True
+    if args.keep_last_ckpts is not None:
+        cfg.keep_last_ckpts = args.keep_last_ckpts
     cfg.selective_ac = bool(getattr(args, "selective_ac", False))
     if cfg.selective_ac:
         cfg.activation_checkpoint = True  # selective implies AC path
@@ -162,6 +222,18 @@ def main():
     world = dist.get_world_size()
     torch.manual_seed(cfg.seed)
 
+    # --- resolve resume EARLY so the data loader can fast-forward past already
+    # consumed instances (avoids re-training on the same data after a restart) ---
+    resume_path = resolve_resume_path(args.resume, cfg.out_dir)
+    resume_step = 0
+    if resume_path:
+        _meta = torch.load(resume_path, map_location="cpu", weights_only=False)
+        resume_step = int(_meta["step"]) + 1   # next step to run
+        del _meta
+    # instances THIS replica consumed before the resume point
+    per_step_replica = cfg.micro_bsz * cfg.grad_accum
+    resume_skip = resume_step * per_step_replica
+
     # --- data ---
     margs = MODELS[cfg.model]()
     cfg.block_size = margs.max_seq_len
@@ -177,10 +249,13 @@ def main():
             margs.vocab_size = max(margs.vocab_size, first_idx["vocab_size"])
         train_ds = EpochMixtureDataset(
             sources, cfg.block_size, seed=cfg.seed,
-            rank=dist.get_rank(), world=world)
+            rank=dist.get_rank(), world=world, resume_skip=resume_skip)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
                             num_workers=4, pin_memory=True, drop_last=True)
         val_loader = None
+        if resume_skip:
+            log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
+                f"(step {resume_step})")
         log(f"[data] multi-source mix '{args.data_mix}': "
             + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
     else:
@@ -290,8 +365,8 @@ def main():
     model.train()
     step = 0
     skipped_steps = 0
-    if args.resume:
-        step = load_ckpt(model, opt, args.resume)
+    if resume_path:
+        step = load_ckpt(model, opt, resume_path)
     # Deterministic GC: disable automatic collection and instead run a light
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
