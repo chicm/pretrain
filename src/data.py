@@ -25,13 +25,17 @@ def read_index(src_dir):
     shard 'path' entries are made relative to src_dir."""
     # merged multi-part layout: src_dir/part_K/index.json
     parts = sorted(glob.glob(os.path.join(src_dir, "part_*")))
-    part_idx = [p for p in parts
-                if os.path.exists(os.path.join(p, "index.json"))]
+    def _part_index(p):
+        # prefer index_v2.json (rebuilt, cache-consistent) over index.json
+        v2 = os.path.join(p, "index_v2.json")
+        v1 = os.path.join(p, "index.json")
+        return v2 if os.path.exists(v2) else (v1 if os.path.exists(v1) else None)
+    part_idx = [p for p in parts if _part_index(p)]
     if part_idx:
         merged = None
         shards = []
         for p in part_idx:
-            with open(os.path.join(p, "index.json")) as f:
+            with open(_part_index(p)) as f:
                 pi = json.load(f)
             if merged is None:
                 merged = {k: pi.get(k) for k in
@@ -45,7 +49,10 @@ def read_index(src_dir):
         merged["shards"] = shards
         return merged
 
-    idx_path = os.path.join(src_dir, "index.json")
+    # flat layout: prefer index_v2.json over index.json (cache-consistent rebuild)
+    idx_path = os.path.join(src_dir, "index_v2.json")
+    if not os.path.exists(idx_path):
+        idx_path = os.path.join(src_dir, "index.json")
     if os.path.exists(idx_path):
         with open(idx_path) as f:
             return json.load(f)
