@@ -31,8 +31,10 @@ for i in 0 1 2 3 4 5 6 7; do
   ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no $n "
     set -e
     # --- sync code to LOCAL disk (avoids network-FS cache issues) ---
+    # git sync is best-effort: a node already at the target commit (or with a
+    # read-only .git, e.g. node-0) must NOT abort its torchrun launch.
     git config --global --add safe.directory $LOCAL 2>/dev/null || true
-    if [ -d $LOCAL/.git ]; then cd $LOCAL && git fetch -q origin && git checkout -q $BRANCH 2>/dev/null && git reset -q --hard origin/$BRANCH; else rm -rf $LOCAL && git clone -q -b $BRANCH $REPO $LOCAL; fi
+    if [ -d $LOCAL/.git ]; then cd $LOCAL && (git fetch -q origin && git checkout -q $BRANCH && git reset -q --hard origin/$BRANCH) 2>/dev/null || echo 'WARN: git sync skipped (perm/lock), using existing checkout'; else rm -rf $LOCAL && git clone -q -b $BRANCH $REPO $LOCAL; fi
     cd $LOCAL/src
     source /opt/conda/etc/profile.d/conda.sh; conda activate $CONDA_ENV
     export HF_HOME=/scratch/hf_local OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
