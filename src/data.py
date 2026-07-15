@@ -149,8 +149,10 @@ class WeightedMultiSourceDataset(IterableDataset):
             if self.count_sources:
                 name = self.src_names[si]
                 self._counts[name] = self._counts.get(name, 0) + 1
-            x = torch.from_numpy(chunk[:-1])
-            y = torch.from_numpy(chunk[1:])
+            # .copy() -> own resizable storage; a from_numpy view of a slice
+            # shares non-resizable storage and breaks DataLoader collate/pin.
+            x = torch.from_numpy(chunk[:-1].copy())
+            y = torch.from_numpy(chunk[1:].copy())
             yield x, y
 
 
@@ -330,8 +332,8 @@ class EpochMixtureDataset(IterableDataset):
             if self.count_sources:
                 name = self.src_names[si]
                 self._counts[name] = self._counts.get(name, 0) + 1
-            x = torch.from_numpy(chunk[:-1])
-            y = torch.from_numpy(chunk[1:])
+            x = torch.from_numpy(chunk[:-1].copy())
+            y = torch.from_numpy(chunk[1:].copy())
             yield x, y
 
 
@@ -687,6 +689,6 @@ class PackedDataset(Dataset):
     def __getitem__(self, i):
         s = i * self.block_size
         chunk = self.data[s: s + self.block_size + 1].astype(np.int64)
-        x = torch.from_numpy(chunk[:-1])
-        y = torch.from_numpy(chunk[1:])
+        x = torch.from_numpy(chunk[:-1].copy())
+        y = torch.from_numpy(chunk[1:].copy())
         return x, y
