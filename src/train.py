@@ -29,6 +29,18 @@ from data import PackedDataset
 from configs import MODELS, TrainConfig
 
 
+def _stack_collate(batch):
+    """Stack (x, y) samples with torch.stack, bypassing torch's default
+    collate_tensor_fn shared-memory 'out=' path (elem.new(storage).resize_),
+    which raises 'Trying to resize storage that is not resizable' on int64
+    tensors derived from numpy memmaps under multi-worker DataLoaders on this
+    ROCm build. torch.stack allocates a fresh contiguous output -> safe."""
+    xs = torch.stack([b[0] for b in batch], 0)
+    ys = torch.stack([b[1] for b in batch], 0)
+    return xs, ys
+
+
+
 def is_master():
     return int(os.environ.get("RANK", 0)) == 0
 
@@ -260,7 +272,8 @@ def main():
             sources, cfg.block_size, seed=cfg.seed,
             rank=dist.get_rank(), world=world, resume_skip=resume_skip)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
-                            num_workers=4, pin_memory=True, drop_last=True)
+                            num_workers=4, pin_memory=True, drop_last=True,
+                            collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
             log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
@@ -275,7 +288,8 @@ def main():
         sampler = DistributedSampler(train_ds, num_replicas=world,
                                      rank=dist.get_rank(), shuffle=True)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz, sampler=sampler,
-                            num_workers=4, pin_memory=True, drop_last=True)
+                            num_workers=4, pin_memory=True, drop_last=True,
+                            collate_fn=_stack_collate)
 
         # optional val set (written by prepare_data when val_frac > 0)
         val_loader = None
@@ -283,7 +297,8 @@ def main():
         if os.path.exists(val_path):
             val_ds = PackedDataset(val_path, cfg.block_size, meta["dtype"])
             val_loader = DataLoader(val_ds, batch_size=cfg.micro_bsz, shuffle=False,
-                                    num_workers=2, pin_memory=True, drop_last=True)
+                                    num_workers=2, pin_memory=True, drop_last=True,
+                                    collate_fn=_stack_collate)
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")
