@@ -197,19 +197,29 @@ class EpochMixtureDataset(IterableDataset):
         self._counts = {}
         self.src_names = []
         self.src_weights = []
-        self.src_shards = []   # per source: list of memmaps
+        self.src_shards = []   # per source: list of (abs_path, np.dtype, n_tokens)
+        self._mm_cache = {}    # lazy per-worker memmap cache: (si,shi)->memmap
         for src_dir, w in sources.items():
             if w <= 0:
                 continue
             idx = read_index(src_dir)
             dtype = np.dtype(idx["dtype"])
+            itemsize = dtype.itemsize
             shards = []
             for sh in idx["shards"]:
                 p = os.path.join(src_dir, sh["path"])
-                mm = np.memmap(p, dtype=dtype, mode="r")
-                if len(mm) <= block_size + 1:
+                # LAZY: do NOT memmap here (cold blobfuse open of hundreds of
+                # shards x 64 ranks hangs for tens of minutes). Derive length
+                # from index tokens or file size; open on first access in __iter__.
+                ntok = sh.get("tokens")
+                if not ntok:
+                    try:
+                        ntok = os.path.getsize(p) // itemsize
+                    except OSError:
+                        continue
+                if ntok <= block_size + 1:
                     continue
-                shards.append(mm)
+                shards.append((p, dtype, int(ntok)))
             if not shards:
                 continue
             self.src_names.append(os.path.basename(src_dir.rstrip("/")))
@@ -223,6 +233,16 @@ class EpochMixtureDataset(IterableDataset):
     def source_counts(self):
         return dict(self._counts)
 
+    def _get_mm(self, si, shi):
+        """Lazily memmap shard (si,shi) on first access; cache per worker."""
+        key = (si, shi)
+        mm = self._mm_cache.get(key)
+        if mm is None:
+            path, dtype, _ = self.src_shards[si][shi]
+            mm = np.memmap(path, dtype=dtype, mode="r")
+            self._mm_cache[key] = mm
+        return mm
+
     def _source_cursor(self, si, rng, global_worker, n_global):
         """Infinite generator of (shard_memmap, start) for source si, drawn
         without replacement within each pass, restricted to this (rank,worker)
@@ -235,8 +255,8 @@ class EpochMixtureDataset(IterableDataset):
             shard_order = rng.permutation(len(shards))
             emitted = 0
             for shi in shard_order:
-                mm = shards[shi]
-                n_inst = (len(mm) - 1) // bs
+                _, _, ntok = shards[shi]         # metadata only; no open yet
+                n_inst = (ntok - 1) // bs
                 if n_inst <= 0:
                     continue
                 # this (rank,worker)'s disjoint slice of instances in this shard
@@ -245,6 +265,7 @@ class EpochMixtureDataset(IterableDataset):
                 if local.size == 0:
                     continue
                 rng.shuffle(local)
+                mm = self._get_mm(si, shi)       # LAZY open only when we read
                 for k in local:
                     yield mm, int(k) * bs
                     emitted += 1
