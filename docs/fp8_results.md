@@ -30,8 +30,16 @@
 ## 端到端验证（8×MI300X 单节点）
 - **1B**：fp8 loss 与 bf16 **逐位一致**（step0 12.348 vs 12.349）、无 NaN、显存更低
   （17.8 vs 20.2G）。168/169 Linear 转换（lm_head 正确跳过）。1B gemm 太小 → 吞吐无增益（符合预期）。
-- **8B**：A/B 进行中（真实 FineWeb 数据 10.2B tok, micro_bsz=4, --fused_ce）。8B 才是能体现
-  1.5× 的规模（微基准就是 8B MLP shape）。
+- **8B @ mbsz=4**（真实 FineWeb 10.2B tok, --fused_ce）✅ **完成**：
+  | 配置 | tok/s | 峰值显存/卡 | loss/NaN |
+  |---|---|---|---|
+  | bf16 | 67.5K | 118.0 G | 基线 |
+  | **fp8** | **84.4K** | **90.0 G** | 曲线重合, 无 NaN |
+  → **+25% 吞吐, −28G 显存**。224/225 Linear 转换（lm_head 跳过）。8B 才体现规模效应（微基准即 8B MLP shape）。
+- **8B @ mbsz=6**（真实数据）：只取到 step-0 显存峰值 —— **bf16 160.2G**（逼近 190G 上限）vs
+  **fp8 118.3G**（省 **~42G**，仍有大余量，理论可继续加 batch）。稳态 tok/s **未取到**：bf16 与 fp8
+  **均卡死在 step-10 的 torch.compile recompile**（~30min 零推进, autotune 病态）。症状两组一致 →
+  是 mbsz=6+8B compile 路径问题，非 fp8 特有。**mbsz=6 这条配置 compile 不实用**，权威数字用 mbsz=4。
 
 ## 代码
 - `src/fp8_utils.py`：`convert_model_to_fp8(model, recipe)`，在 fully_shard/compile **之前**调用。
@@ -39,7 +47,7 @@
 - `src/train.py`：新增 `--fp8` / `--fp8_recipe {tensorwise,rowwise}`。`--fp8` 强制要求 compile。
 
 ## 待办
-- [ ] 8B A/B 吞吐数字（mbsz=4, 真实数据）。
+- [x] 8B A/B 吞吐数字（mbsz=4, 真实数据）→ **+25%, −28G**。
 - [ ] **在主力 MI300 集群（ROCm 6.4.3）单卡重跑 `_probe_fnuz.py`** —— 一锤定音「版本问题 vs 方法问题」：
   若 ROCm6 上 fnuz `_scaled_mm` 也快 → 生产集群现在就能用 fp8，不必等升级。
 - [ ] fp8 长跑 loss 曲线 vs bf16（收敛性确认后再进 mi300_mn.sh 默认）。
