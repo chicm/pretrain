@@ -1,0 +1,5 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: rocm7-pytorch-training
+version: "26.1"
+image: 982c7eb8db344340a4baff2920aa94b8.azurecr.io/rocm-pytorch-training:v26.1
+description: AMD ROCm 7 PyTorch training image (rocm/pytorch-training:v26.1), imported to workspace ACR. No rebuild.

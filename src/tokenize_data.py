@@ -38,6 +38,10 @@ def main():
                     help="stop after this many tokens (per-source budget)")
     ap.add_argument("--data_files", default=None,
                     help="optional HF data_files glob/pattern")
+    ap.add_argument("--file_shards", type=int, default=1,
+                    help="partition parquet files across this many parallel workers")
+    ap.add_argument("--file_shard_id", type=int, default=0,
+                    help="this worker's file-shard index [0, file_shards)")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -53,7 +57,8 @@ def main():
             args.dataset, args.out, tok, split=args.split,
             text_key=args.text_key, hf_config=args.hf_config, eot_id=eot_id,
             shard_tokens=args.shard_tokens, target_tokens=args.target_tokens,
-            num_proc=args.num_proc, data_files=args.data_files, streaming=True)
+            num_proc=args.num_proc, data_files=args.data_files, streaming=True,
+            file_shards=args.file_shards, file_shard_id=args.file_shard_id)
     else:
         prepare_data(args.dataset, args.out, tok, split=args.split,
                      text_key=args.text_key, num_proc=args.num_proc,

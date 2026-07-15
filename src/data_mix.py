@@ -13,22 +13,31 @@ SOURCE_DIRS = {
     "dclm":        "dclm_tok",
     "fineweb_edu": "fineweb_edu_240bt_tok",   # fresh 240B tokenization for 1T mix
     "finepdfs":    "finepdfs_edu_tok",
-    "code":        "code_tok",                # codeparrot-clean (Python, non-gated)
-    "math":        "math_tok",                # finemath-3plus + open-web-math
+    "code":        "starcoder_tok",           # bigcode/starcoderdata (gated, token)
+    "math":        "math_tok",                # finemath-3plus
+    "infimath":    "infimath_tok",            # infiwebmath-3plus
+    "owm":         "owm_tok",                 # open-web-math/open-web-math
     "finephrase":  "finephrase_tok",
 }
 
-# 1T target mix (see docs/data_scaling_1T_design.md §2, revised for non-gated sources).
-# NOTE: bigcode/StarCoder code sets are HF-gated and no token is available on the
-# cluster, so code is limited to codeparrot-clean (Python). If a token is later
-# provided, swap in the-stack-v2 and raise the code share.
+# 1T target mix (see docs/data_scaling_1T_design.md §2, §9).
+# Plan B (user-approved): math limited to ~1 epoch of the actually-available unique
+# math tokens (~66B total across 3 sources) instead of forcing 100B via repetition.
+# The freed ~3.4% is reallocated to dclm (largest, safest to upweight).
+#   web(dclm+fineweb+finepdfs) = 58.4%, synthetic(finephrase) = 20%, code = 15%,
+#   math(3 sources, ~1 epoch each) = 6.6%.
+# Math split is proportional to each source's on-disk unique tokens (1 epoch):
+#   math_tok(finemath-3plus 31.2B)=3.12%, infimath(infiwebmath 21.6B)=2.16%,
+#   owm(OpenWebMath 13.2B)=1.32%.
 MIX_1T = {
-    "dclm":        0.42,   # 420B  high-quality web (CC-BY)
-    "fineweb_edu": 0.24,   # 240B  educational web (ODC-By)
-    "finepdfs":    0.08,   #  80B  PDF-sourced (ODC-By), quality >= Nemotron-CC-v2
-    "math":        0.12,   # 120B  finemath-3plus + open-web-math
-    "code":        0.04,   #  40B  codeparrot-clean Python (non-gated)
-    "finephrase":  0.10,   # 100B  synthetic rewrite (ODC-By)
+    "dclm":        0.354,  # ~354B  high-quality web (CC-BY); absorbs freed math budget
+    "fineweb_edu": 0.18,   #  180B  educational web (ODC-By)
+    "finepdfs":    0.05,   #   50B  PDF-sourced (ODC-By)
+    "finephrase":  0.20,   #  200B  synthetic rewrite (ODC-By)
+    "code":        0.15,   #  150B  starcoderdata multi-lang (HF token)
+    "math":        0.0312, #  ~31B  finemath-3plus (~1 epoch)
+    "infimath":    0.0216, #  ~22B  infiwebmath-3plus (~1 epoch)
+    "owm":         0.0132, #  ~13B  OpenWebMath (~1 epoch)
 }
 
 
@@ -59,7 +68,8 @@ def resolve_mix(name_or_json, data_root):
         import glob
         has = (os.path.exists(os.path.join(d, "index.json")) or
                os.path.exists(os.path.join(d, "train.bin")) or
-               glob.glob(os.path.join(d, "shard_*.bin")))
+               glob.glob(os.path.join(d, "shard_*.bin")) or
+               glob.glob(os.path.join(d, "part_*", "index.json")))
         if has:
             out[d] = w
         else:

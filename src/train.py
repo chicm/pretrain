@@ -10,6 +10,7 @@ import math
 import json
 import time
 import argparse
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
@@ -38,7 +39,12 @@ def log(*a):
 
 
 def setup_dist():
-    dist.init_process_group(backend="nccl")
+    # Slow/cold blobfuse-backed shards can stall a rank's first read of a large
+    # shard for many minutes; the default 10-min NCCL watchdog then aborts the
+    # whole job on the next collective. Raise the collective timeout so a
+    # one-time cold read can complete (steady-state cached reads are fast).
+    dist.init_process_group(backend="nccl",
+                            timeout=timedelta(minutes=60))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -65,9 +71,60 @@ def save_ckpt(model, opt, step, cfg):
     if not is_master():
         return
     path = os.path.join(cfg.out_dir, f"ckpt_{step}.pt")
+    tmp = path + ".tmp"
     torch.save({"model": model_sd, "opt": opt_sd, "step": step,
-                "cfg": cfg.__dict__}, path)
+                "cfg": cfg.__dict__}, tmp)
+    os.replace(tmp, path)   # atomic: a crash mid-write never leaves a half ckpt
+    # write/refresh the "latest" pointer so --resume latest just works
+    with open(os.path.join(cfg.out_dir, "latest"), "w") as f:
+        f.write(f"ckpt_{step}.pt\n")
     log(f"[ckpt] saved {path}")
+    _prune_ckpts(cfg)
+
+
+def _prune_ckpts(cfg):
+    """Keep only the most recent cfg.keep_last_ckpts checkpoints on disk.
+    Each 8B full-state ckpt is huge (~180GB incl optimizer), so unbounded
+    saves would fill the disk over a 238K-step run. Master-only."""
+    keep = getattr(cfg, "keep_last_ckpts", 3)
+    if keep <= 0:
+        return
+    import glob, re
+    files = glob.glob(os.path.join(cfg.out_dir, "ckpt_*.pt"))
+    def _step_of(p):
+        m = re.search(r"ckpt_(\d+)\.pt$", p)
+        return int(m.group(1)) if m else -1
+    files = sorted(files, key=_step_of)
+    for p in files[:-keep]:
+        try:
+            os.remove(p)
+            log(f"[ckpt] pruned old {os.path.basename(p)}")
+        except OSError as e:
+            log(f"[ckpt] prune failed {p}: {e}")
+
+
+def resolve_resume_path(spec, out_dir):
+    """Map --resume value to a concrete ckpt path.
+      * 'latest'         -> read <out_dir>/latest pointer
+      * a bare filename  -> <out_dir>/<filename>
+      * an explicit path -> used as-is
+    Returns None if nothing to resume from (fresh start)."""
+    if not spec:
+        return None
+    if spec == "latest":
+        ptr = os.path.join(out_dir, "latest")
+        if not os.path.exists(ptr):
+            log(f"[ckpt] --resume latest but no '{ptr}' found -> starting fresh")
+            return None
+        name = open(ptr).read().strip()
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            log(f"[ckpt] latest points to missing {path} -> starting fresh")
+            return None
+        return path
+    if os.path.dirname(spec):
+        return spec
+    return os.path.join(out_dir, spec)
 
 
 def load_ckpt(model, opt, path):
@@ -119,15 +176,30 @@ def main():
     ap.add_argument("--selective_ac", action="store_true",
                     help="selective activation checkpointing: save expensive matmul/SDPA outputs, "
                          "recompute cheap elementwise/norm. Overrides --activation_checkpoint.")
-    ap.add_argument("--resume", default=None, help="path to a ckpt_*.pt to resume from")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint to resume from: 'latest' (auto from <out_dir>/latest), "
+                         "a bare filename (ckpt_5000.pt), or an explicit path. Restores "
+                         "model+opt+step and fast-forwards the data stream so no data is "
+                         "re-trained.")
+    ap.add_argument("--keep_last_ckpts", type=int, default=None,
+                    help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
+                         "0 = keep all. Prevents disk blow-up over long runs.")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
     ap.add_argument("--hsdp_shard", type=int, default=0,
                     help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
                          "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
-    ap.add_argument("--fused_ce", action="store_true",
+    ap.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=True,
                     help="use flash-attn Triton fused cross-entropy (online softmax, no fp32 "
-                         "logits materialization; ~14GB less peak mem at 8B vocab -> bigger micro_bsz)")
+                         "logits materialization; ~14GB less peak mem at 8B vocab -> bigger micro_bsz). "
+                         "DEFAULT ON; use --no-fused_ce to opt out.")
+    ap.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True,
+                    help="convert attn/MLP Linear layers to torchao float8 training "
+                         "(MI300X: auto fnuz dtype). DEFAULT ON (validated +24.5%% tput, "
+                         "-28GB mem on MI300X). REQUIRES compile (do NOT pass --no_compile). "
+                         "Pass --no-fp8 to disable (falls back to bf16).")
+    ap.add_argument("--fp8_recipe", default="tensorwise", choices=["tensorwise", "rowwise"],
+                    help="fp8 scaling recipe: tensorwise (fastest ~1.5x) or rowwise (accurate ~1.4x)")
     args = ap.parse_args()
 
     cfg = TrainConfig()
@@ -139,14 +211,18 @@ def main():
         cfg.compile = False
     if args.activation_checkpoint:
         cfg.activation_checkpoint = True
+    if args.keep_last_ckpts is not None:
+        cfg.keep_last_ckpts = args.keep_last_ckpts
     cfg.selective_ac = bool(getattr(args, "selective_ac", False))
     if cfg.selective_ac:
         cfg.activation_checkpoint = True  # selective implies AC path
 
     # Per-model training-stability overrides. Larger/deeper models need a
     # smaller peak LR and longer warmup to stay numerically stable in bf16.
+    # 8B: sqrt(2) LR bump (2e-4 -> 2.8e-4) for the doubled global batch on
+    # 64 GPUs (2.10M -> 4.19M tok/step), warmup 500 -> 1500 to match.
     _MODEL_OPT = {
-        "8b": dict(lr=2e-4, min_lr=2e-5, warmup_steps=500),
+        "8b": dict(lr=2.8e-4, min_lr=2.8e-5, warmup_steps=1500),
     }
     for k, v in _MODEL_OPT.get(cfg.model, {}).items():
         setattr(cfg, k, v)
@@ -155,12 +231,24 @@ def main():
     world = dist.get_world_size()
     torch.manual_seed(cfg.seed)
 
+    # --- resolve resume EARLY so the data loader can fast-forward past already
+    # consumed instances (avoids re-training on the same data after a restart) ---
+    resume_path = resolve_resume_path(args.resume, cfg.out_dir)
+    resume_step = 0
+    if resume_path:
+        _meta = torch.load(resume_path, map_location="cpu", weights_only=False)
+        resume_step = int(_meta["step"]) + 1   # next step to run
+        del _meta
+    # instances THIS replica consumed before the resume point
+    per_step_replica = cfg.micro_bsz * cfg.grad_accum
+    resume_skip = resume_step * per_step_replica
+
     # --- data ---
     margs = MODELS[cfg.model]()
     cfg.block_size = margs.max_seq_len
     if getattr(args, "data_mix", None):
         # multi-source weighted sampling (1T corpus)
-        from data import WeightedMultiSourceDataset, read_index
+        from data import EpochMixtureDataset, read_index
         from data_mix import resolve_mix
         data_root = args.data_root or cfg.data_dir
         sources = resolve_mix(args.data_mix, data_root)
@@ -168,12 +256,15 @@ def main():
         first_idx = read_index(list(sources.keys())[0])
         if first_idx.get("vocab_size"):
             margs.vocab_size = max(margs.vocab_size, first_idx["vocab_size"])
-        train_ds = WeightedMultiSourceDataset(
+        train_ds = EpochMixtureDataset(
             sources, cfg.block_size, seed=cfg.seed,
-            rank=dist.get_rank(), world=world)
+            rank=dist.get_rank(), world=world, resume_skip=resume_skip)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
                             num_workers=4, pin_memory=True, drop_last=True)
         val_loader = None
+        if resume_skip:
+            log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
+                f"(step {resume_step})")
         log(f"[data] multi-source mix '{args.data_mix}': "
             + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
     else:
@@ -196,9 +287,27 @@ def main():
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")
-    model.fused_ce = bool(getattr(args, "fused_ce", False))
+    model.fused_ce = bool(getattr(args, "fused_ce", True))
     if model.fused_ce:
-        log("[ce] flash-attn Triton fused cross-entropy ON")
+        # DEFAULT ON now — probe flash-attn availability so a missing dep on any
+        # node degrades to plain F.cross_entropy instead of crashing the run.
+        try:
+            from flash_attn.ops.triton.cross_entropy import cross_entropy_loss  # noqa: F401
+            log("[ce] flash-attn Triton fused cross-entropy ON")
+        except Exception as e:
+            model.fused_ce = False
+            log(f"[ce] fused CE unavailable ({type(e).__name__}: {e}) -> "
+                "falling back to F.cross_entropy")
+    # FP8: convert eligible Linear layers BEFORE fully_shard + compile.
+    # fp8 is ON by default; if compile is disabled it would be ~2x slower than
+    # bf16, so gracefully fall back to bf16 instead of erroring.
+    if getattr(args, "fp8", False):
+        if not cfg.compile:
+            log("[fp8] compile disabled (--no_compile) -> fp8 auto-disabled, "
+                "falling back to bf16 (eager fp8 is ~2x slower).")
+        else:
+            from fp8_utils import convert_model_to_fp8
+            convert_model_to_fp8(model, recipe=args.fp8_recipe, log=log)
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
@@ -273,8 +382,8 @@ def main():
     model.train()
     step = 0
     skipped_steps = 0
-    if args.resume:
-        step = load_ckpt(model, opt, args.resume)
+    if resume_path:
+        step = load_ckpt(model, opt, resume_path)
     # Deterministic GC: disable automatic collection and instead run a light
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
