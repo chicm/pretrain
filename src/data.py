@@ -243,17 +243,28 @@ class EpochMixtureDataset(IterableDataset):
             self._mm_cache[key] = mm
         return mm
 
+    def _replica_owns(self, si, global_worker, n_global):
+        """True if this (rank,worker) replica owns >=1 instance of source si.
+        Pure metadata (no memmap open)."""
+        bs = self.block_size
+        for (_, _, ntok) in self.src_shards[si]:
+            n_inst = (ntok - 1) // bs
+            if n_inst > global_worker and n_inst > 0:
+                # stride arange(global_worker, n_inst, n_global) non-empty
+                return True
+        return False
+
     def _source_cursor(self, si, rng, global_worker, n_global):
-        """Infinite generator of (shard_memmap, start) for source si, drawn
+        """INFINITE generator of (shard_memmap, start) for source si, drawn
         without replacement within each pass, restricted to this (rank,worker)
-        slice via a global stride, reshuffling on each new pass."""
+        slice via a global stride, reshuffling on each new pass. Callers MUST
+        only build cursors for sources this replica actually owns (see
+        _replica_owns), otherwise this loops forever emitting nothing."""
         shards = self.src_shards[si]
         bs = self.block_size
-        pass_no = 0
         while True:
             # shuffle shard visitation order for this pass
             shard_order = rng.permutation(len(shards))
-            emitted = 0
             for shi in shard_order:
                 _, _, ntok = shards[shi]         # metadata only; no open yet
                 n_inst = (ntok - 1) // bs
@@ -268,12 +279,6 @@ class EpochMixtureDataset(IterableDataset):
                 mm = self._get_mm(si, shi)       # LAZY open only when we read
                 for k in local:
                     yield mm, int(k) * bs
-                    emitted += 1
-            pass_no += 1
-            if emitted == 0:
-                # this rank/worker owns no instances of this source; avoid a
-                # tight infinite loop -- yield nothing by breaking to fallback
-                return
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -284,37 +289,39 @@ class EpochMixtureDataset(IterableDataset):
         # source-selection RNG (same across shards); per (rank,worker) stream
         sel_rng = np.random.default_rng(
             self.seed + self.rank * 100003 + worker_id * 10007)
-        # each source gets its own permutation RNG stream
-        cursors = [self._source_cursor(
+        n_src = len(self.src_shards)
+        # Determine which sources THIS replica actually owns instances of.
+        # Small sources (owm/infimath) split across world*num_workers may leave
+        # some replicas with zero instances. We zero their weight ONCE upfront
+        # (deterministic, no mid-stream weight mutation) so every replica emits
+        # an INFINITE, well-defined batch stream -> fixed step count keeps all
+        # ranks in NCCL lockstep (fixes collective-timeout SIGABRT).
+        owned = [si for si in range(n_src)
+                 if self._replica_owns(si, global_worker, n_global)]
+        if not owned:
+            owned = list(range(n_src))  # degenerate safety; shouldn't happen
+        w = np.asarray(self.src_weights, dtype=np.float64).copy()
+        keep = np.zeros(n_src, dtype=bool)
+        keep[owned] = True
+        w = np.where(keep, w, 0.0)
+        wsum = w.sum()
+        sel_p = (w / wsum) if wsum > 0 else None
+        # infinite cursors ONLY for owned sources
+        cursors = {si: self._source_cursor(
                        si,
                        np.random.default_rng(self.seed + 777 * (si + 1)
                                              + self.rank * 100003
                                              + worker_id * 10007),
                        global_worker, n_global)
-                   for si in range(len(self.src_shards))]
+                   for si in owned}
         bs1 = self.block_size + 1
-        n_src = len(self.src_shards)
-        active = list(range(n_src))
         # deterministic fast-forward for resume: this replica's total skip is
         # split evenly across its workers (main loop consumes round-robin).
         skip = self.resume_skip // max(1, num_workers)
         produced = 0
-        while active:
-            si = sel_rng.choice(n_src, p=self.src_weights)
-            try:
-                mm, start = next(cursors[si])
-            except StopIteration:
-                # source owns no instances for this replica; drop it & renorm
-                if si in active:
-                    active.remove(si)
-                if not active:
-                    break
-                w = self.src_weights.copy()
-                mask = np.ones(n_src, dtype=bool)
-                mask[[i for i in range(n_src) if i not in active]] = False
-                w = np.where(mask, w, 0.0)
-                self.src_weights = w / w.sum()
-                continue
+        while True:
+            si = int(sel_rng.choice(n_src, p=sel_p))
+            mm, start = next(cursors[si])   # cursors are infinite -> never stops
             # fast-forward: advance the SAME deterministic stream but don't yield
             if produced < skip:
                 produced += 1
