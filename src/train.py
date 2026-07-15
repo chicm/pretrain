@@ -10,6 +10,7 @@ import math
 import json
 import time
 import argparse
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
@@ -38,7 +39,12 @@ def log(*a):
 
 
 def setup_dist():
-    dist.init_process_group(backend="nccl")
+    # Slow/cold blobfuse-backed shards can stall a rank's first read of a large
+    # shard for many minutes; the default 10-min NCCL watchdog then aborts the
+    # whole job on the next collective. Raise the collective timeout so a
+    # one-time cold read can complete (steady-state cached reads are fast).
+    dist.init_process_group(backend="nccl",
+                            timeout=timedelta(minutes=60))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
