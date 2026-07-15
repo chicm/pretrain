@@ -19,7 +19,7 @@ MAX_STEPS=${MAX_STEPS:-500}
 MICRO_BSZ=${MICRO_BSZ:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
 MODEL=${MODEL:-1b}
-EXTRA_ARGS=${EXTRA_ARGS:---fused_ce}   # default: fused CE (flash-attn Triton). e.g. add "--activation_checkpoint"
+EXTRA_ARGS=${EXTRA_ARGS:-}   # fused_ce, fp8, compile are ON by default in train.py. e.g. add "--activation_checkpoint" or "--data_mix mix_1t --data_root $SHARED/data --resume latest"
 COMPILE_FLAG=${COMPILE_FLAG:-}   # default ON (empty = torch.compile enabled); set COMPILE_FLAG="--no_compile" to disable
 RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs

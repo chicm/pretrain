@@ -183,9 +183,10 @@ def main():
     ap.add_argument("--hsdp_shard", type=int, default=0,
                     help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
                          "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
-    ap.add_argument("--fused_ce", action="store_true",
+    ap.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=True,
                     help="use flash-attn Triton fused cross-entropy (online softmax, no fp32 "
-                         "logits materialization; ~14GB less peak mem at 8B vocab -> bigger micro_bsz)")
+                         "logits materialization; ~14GB less peak mem at 8B vocab -> bigger micro_bsz). "
+                         "DEFAULT ON; use --no-fused_ce to opt out.")
     ap.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True,
                     help="convert attn/MLP Linear layers to torchao float8 training "
                          "(MI300X: auto fnuz dtype). DEFAULT ON (validated +24.5%% tput, "
@@ -278,9 +279,17 @@ def main():
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")
-    model.fused_ce = bool(getattr(args, "fused_ce", False))
+    model.fused_ce = bool(getattr(args, "fused_ce", True))
     if model.fused_ce:
-        log("[ce] flash-attn Triton fused cross-entropy ON")
+        # DEFAULT ON now — probe flash-attn availability so a missing dep on any
+        # node degrades to plain F.cross_entropy instead of crashing the run.
+        try:
+            from flash_attn.ops.triton.cross_entropy import cross_entropy_loss  # noqa: F401
+            log("[ce] flash-attn Triton fused cross-entropy ON")
+        except Exception as e:
+            model.fused_ce = False
+            log(f"[ce] fused CE unavailable ({type(e).__name__}: {e}) -> "
+                "falling back to F.cross_entropy")
     # FP8: convert eligible Linear layers BEFORE fully_shard + compile.
     # fp8 is ON by default; if compile is disabled it would be ~2x slower than
     # bf16, so gracefully fall back to bf16 instead of erroring.
