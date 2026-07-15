@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-node 1B launcher (code-sync workflow) for an 8-GPU-per-node AMD (MI300X) cluster.
+# Multi-node launcher (code-sync workflow) for an 8-GPU-per-node AMD (MI300X) cluster.
 # Each node: git clone/pull repo -> LOCAL fast disk -> run from there.
 # Data stays on the shared mount (large seq reads, fast+consistent). ckpt -> shared.
 #
@@ -17,7 +17,7 @@ DATA=${DATA:-$SHARED/data/tinystories_tok}
 OUT=${OUT:-$SHARED/checkpoints/mn_1b}
 MAX_STEPS=${MAX_STEPS:-500}
 MICRO_BSZ=${MICRO_BSZ:-4}
-GRAD_ACCUM=${GRAD_ACCUM:-8}
+GRAD_ACCUM=${GRAD_ACCUM:-4}
 MODEL=${MODEL:-1b}
 EXTRA_ARGS=${EXTRA_ARGS:---fused_ce}   # default: fused CE (flash-attn Triton). e.g. add "--activation_checkpoint"
 COMPILE_FLAG=${COMPILE_FLAG:-}   # default ON (empty = torch.compile enabled); set COMPILE_FLAG="--no_compile" to disable
@@ -25,8 +25,8 @@ RDZV_ID=${RDZV_ID:-mn_$MODEL}
 LOGDIR=$SHARED/logs
 mkdir -p "$OUT" "$LOGDIR"
 rm -f "$LOGDIR"/mn_node*.log
-NODES=(node-0 node-1 node-2 node-3)
-for i in 0 1 2 3; do
+NODES=(node-0 node-1 node-2 node-3 node-4 node-5 node-6 node-7)
+for i in 0 1 2 3 4 5 6 7; do
   n=${NODES[$i]}
   ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no $n "
     set -e
@@ -38,7 +38,7 @@ for i in 0 1 2 3; do
     export HF_HOME=/scratch/hf_local OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
     export NCCL_DEBUG=WARN NCCL_SOCKET_IFNAME=eth0 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 PYTHONUNBUFFERED=1
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    nohup torchrun --nnodes=4 --nproc_per_node=8 --node_rank=$i \
+    nohup torchrun --nnodes=8 --nproc_per_node=8 --node_rank=$i \
       --rdzv_id=$RDZV_ID --rdzv_backend=c10d --rdzv_endpoint=node-0:29500 --rdzv_conf=timeout=900 \
       train.py --model $MODEL --data_dir $DATA --out_dir $OUT \
       --micro_bsz $MICRO_BSZ --grad_accum $GRAD_ACCUM --max_steps $MAX_STEPS $COMPILE_FLAG $EXTRA_ARGS \
@@ -46,4 +46,4 @@ for i in 0 1 2 3; do
   " &
 done
 wait
-echo "launched 4 nodes x 8 GPU (code synced to LOCAL disk per node)"
+echo "launched 8 nodes x 8 GPU (code synced to LOCAL disk per node)"
