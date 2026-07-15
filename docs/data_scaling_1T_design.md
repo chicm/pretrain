@@ -213,5 +213,113 @@ math ~2h、finepdfs ~2h。全部 1T 约 4h 内完成。
 
 1. 周期性 `_status6.sh` 监控至各源达标，确认无残留分片。
 2. 混合 smoke：8B ~200 步 `--data_root $S/data --data_mix mix_1t`，校验加权采样比例。
-3. 启动 1T 训练：MAX_STEPS ~238000，配置 fused_ce + mbsz4 + grad_accum8 + compile
-   （250.8K tok/s 已锁定）。
+3. 启动 1T 训练：MAX_STEPS ~238000，配置 fused_ce + mbsz4 + grad_accum4 + compile
+   + fp8（详见 §10；实际吞吐 ~610K tok/s / 64 GPU）。
+
+---
+
+## 10. 实际训练落地（2026-07，正式 1T 已启动）
+
+> 本节记录从 tokenize 完成到 1T 正式训练启动之间的所有工程决策与踩坑根治，
+> 是 §1–§9 计划的**实际执行结果**。8B/100BT 基线训练已完成，吞吐优化已完成，
+> 现进入 1T 多源正式训练。
+
+### 10.1 语料最终落地（8 源，~938B unique）
+
+各源实际 token（`du -bc`/4 精确统计，awk %d 32-bit 会截断需避免）：
+
+| 源 | 实际 token | 目标 | 备注 |
+|---|---|---|---|
+| dclm | 308B | 320B | 用户接受不补顶，训练中 ~1.15 epoch |
+| fineweb_edu | 174B | 180B | |
+| finephrase | 192B | 200B | 合成改写 |
+| code (starcoder) | 134B | 150B | HF-gated 已授权 |
+| finepdfs | 62B | 50B | |
+| math (finemath) | 33.2B | 100B | |
+| infimath | 21.6B | — | 追加数学源 |
+| owm (open-web-math) | 13.2B | — | 追加数学源 |
+| **合计** | **~938B** | 1000B | 权重采样补足到 1T |
+
+**最终 1T mix（plan B，`src/data_mix.py`）**：dclm 35.4%、fineweb_edu 18%、
+finephrase 20%、code 15%、math 3.12%、infimath 2.16%、owm 1.32%、finepdfs 5%。
+dclm 354B 目标但仅 308B unique → ~1.15 epoch（可接受）。
+
+### 10.2 训练侧重大变更
+
+1. **fp8 默认 ON**（commit `3798ed6`）：MI300 tensorwise recipe，224/225 层转换，
+   torchao 0.13，实测 **+24.5% 吞吐 / -28GB 显存**。`--fp8`/`--no-fp8`，`--fused_ce`/
+   `--no-fused_ce`、compile 全部**代码内默认 ON**，启动脚本 EXTRA_ARGS 仅放业务 flag。
+2. **OLMo 式 `EpochMixtureDataset`**（`76e579a`）替代 WeightedMultiSource 作为 mix 主力：
+   无限 per-replica 确定性流、上来即把非本源权重清零、懒 memmap（修 64-rank 冷 blobfuse
+   初始化 hang）。
+3. **扩到 8 节点 / 64 GPU，plan A 保持全局 batch**（`151781b`）：grad_accum 8→4 抵消
+   world 32→64。但相对**实际** 8B run（mbsz2/ga8/world32=2.10M）全局 batch **翻倍**到
+   mbsz4×ga4×world64×seq4096 = **4.19M tok/step**。
+4. **LR 随 batch √2 上调**（`3f08484`）：`_MODEL_OPT["8b"]` lr 2e-4→**2.8e-4**、
+   min_lr 2e-5→**2.8e-5**、warmup 500→**1500**。
+5. **fused CE 默认 ON**（`a14ac87`）：flash-attn Triton CE + 可用性探测 + graceful
+   fallback 到 `F.cross_entropy`。
+6. **checkpoint / 续训大改**（`87f73a5`）：`save_ckpt` 原子 tmp+`os.replace` + `latest`
+   指针 + `_prune_ckpts`（`keep_last_ckpts` 默认 3）；`resolve_resume_path` 支持
+   `latest`/裸文件名/显式路径 + graceful fresh-start；**数据快进** `resume_skip` 重放
+   同一确定性选择流跳过已消费样本（per-worker = `resume_skip//num_workers`）。
+7. **`--tb_dir` flag**（`23ab530`）：TensorBoard log 目录可覆盖，指向系统 TB 目录
+   （`/scratch/azureml/cr/j/<id>/exe/wd`），平台自带 tensorboard 直接读取，无需自起 server。
+
+### 10.3 数据加载踩坑与根治
+
+1. **collate resize-storage 崩溃**：`RuntimeError: Trying to resize storage that is
+   not resizable` @ `collate_tensor_fn`。`.copy()`（`b4e5603`）**无效**；真正修复是
+   模块级 **`_stack_collate(batch)`**（`torch.stack`，绕过共享内存 `out=` 路径），
+   接到全部 3 个 DataLoader（commit `d46a14d`）。
+2. **短/空尾切片崩溃**：修完 collate 后暴露真根因
+   `stack expects each tensor to be equal size, got [4096] and [0]` @ rank19。
+   某 shard 的 index `ntok` **大于真实 memmap 长度**（dclm 被中断的尾 shard：index 记
+   320B 但只写 308B），末尾切片越界返回短/空数组。**根治**：yield 前校验
+   `chunk.shape[0] != bs1` 则 `continue`，加到 EpochMixture + WeightedMultiSource
+   （commit `6609a71`）。此前误判为「node-2 硬件/代码陈旧」，实为纯数据边界 bug，
+   任何 rank 都可能命中。
+
+### 10.4 部署踩坑
+
+- **node-0 与 node-2 `/scratch/code` 属 root**：launcher 的 aiscuser ssh 无法 git-pull
+  → 停在陈旧代码（「one node runs old code」反复根因）。root/`run_remote.py`（落地为
+  uid=0）可更新。**每次正式启动前必须先 root-update node-0 到目标 HEAD**。
+  （node-2 实测 `.git` 属 aiscuser、可自更新，非此列。）
+- `mi300_mn.sh` git-sync 改为 best-effort 非致命（`d8b4676`），避免只读 `.git` 中断
+  torchrun。
+- blobfuse per-node 覆盖缓存：push `_*.sh` 用新文件名（`_v1`,`_v2`…）避免读到陈旧内容。
+
+### 10.5 Smoke 验收（200 步，8 节点 × 8 GPU）
+
+全绿通过并正常退出：8/8 节点起 41 procs；fp8 224/225；模型 7.602B / world=64 /
+FSDP2 1D；flash-attn CE ON；loss 12.77→6.06 单调下降；吞吐稳定 **~601–607K tok/s**；
+显存 76.7G；`ckpt_200.pt` 已存。200 步内 non-finite grad skip 3 次（1.5%，均在 warmup
+早期 LR<3e-5 段，被自动跳过保护兜住，loss 未受影响）→ 正式训练前 2000 步需盯 skip 率。
+
+### 10.6 1T 正式训练启动状态（LOCKED）
+
+- **启动脚本**：`_launch_1t_v1.sh`（node-0 setsid fan-out node-0..7，nohup torchrun
+  --nnodes=8）。
+- **配置锁定**：model 8b，seq 4096，**mbsz 4 / grad_accum 4 / world 64**，global batch
+  **4.19M tok/step**，**max_steps 238000**，LR 2.8e-4 / min_lr 2.8e-5 / warmup 1500，
+  fp8 + fused_ce + compile 默认 ON，`--data_mix mix_1t --data_root $S/data`，
+  `--resume latest --keep_last_ckpts 3`，`--tb_dir /scratch/azureml/cr/j/<id>/exe/wd`。
+- **启动确认**：8 节点全起，loss 12.77→9.12，吞吐 **~607–612K tok/s**，skip=0，无
+  traceback，TB log 已写入系统目录。**ETA ~456h ≈ ~19 天** wall-clock（可断可续）。
+- **监控计划**：前 ~2000 步（覆盖 warmup 到 peak LR 2.8e-4）盯 skip 率；若 >5% 则停下
+  把 peak LR 降到 ~2.4e-4 再 `--resume latest` 续训。
+
+### 10.7 与原计划的差异小结
+
+| 项 | 原计划（§1–§9） | 实际落地（§10） |
+|---|---|---|
+| 平台 | 32×MI300（4 节点） | **64×MI300（8 节点）** |
+| 全局 batch | 4.2M（mbsz4/ga8/world32 计划） | 4.19M（mbsz4/**ga4**/world64） |
+| LR | 未定 | **2.8e-4**（√2 上调）/ warmup 1500 |
+| 吞吐 | 250.8K tok/s | **~610K tok/s**（fp8 + 64 GPU） |
+| 精度 | bf16 | **fp8**（默认 ON）+ bf16 param |
+| 源数 | 5–6 源 | **8 源** ~938B unique |
+| loader | WeightedMultiSource | **EpochMixtureDataset**（OLMo 式） |
+| 续训 | checkpoint 每 2000 步 | + latest 指针 + 数据快进 + ckpt 轮转 |
+| ETA | ~46 GPU-天 | ~19 天 wall（64 GPU 并行） |
