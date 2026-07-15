@@ -213,8 +213,10 @@ def main():
 
     # Per-model training-stability overrides. Larger/deeper models need a
     # smaller peak LR and longer warmup to stay numerically stable in bf16.
+    # 8B: sqrt(2) LR bump (2e-4 -> 2.8e-4) for the doubled global batch on
+    # 64 GPUs (2.10M -> 4.19M tok/step), warmup 500 -> 1500 to match.
     _MODEL_OPT = {
-        "8b": dict(lr=2e-4, min_lr=2e-5, warmup_steps=500),
+        "8b": dict(lr=2.8e-4, min_lr=2.8e-5, warmup_steps=1500),
     }
     for k, v in _MODEL_OPT.get(cfg.model, {}).items():
         setattr(cfg, k, v)
