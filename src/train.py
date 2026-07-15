@@ -160,7 +160,7 @@ def main():
     cfg.block_size = margs.max_seq_len
     if getattr(args, "data_mix", None):
         # multi-source weighted sampling (1T corpus)
-        from data import WeightedMultiSourceDataset, read_index
+        from data import EpochMixtureDataset, read_index
         from data_mix import resolve_mix
         data_root = args.data_root or cfg.data_dir
         sources = resolve_mix(args.data_mix, data_root)
@@ -168,7 +168,7 @@ def main():
         first_idx = read_index(list(sources.keys())[0])
         if first_idx.get("vocab_size"):
             margs.vocab_size = max(margs.vocab_size, first_idx["vocab_size"])
-        train_ds = WeightedMultiSourceDataset(
+        train_ds = EpochMixtureDataset(
             sources, cfg.block_size, seed=cfg.seed,
             rank=dist.get_rank(), world=world)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,

@@ -147,6 +147,151 @@ class WeightedMultiSourceDataset(IterableDataset):
             yield x, y
 
 
+class EpochMixtureDataset(IterableDataset):
+    """OLMo-style multi-source loader: WITHOUT-replacement, shuffle-and-traverse.
+
+    Contrast with WeightedMultiSourceDataset (random start, WITH replacement),
+    which only covers ~63% of each source per 1 epoch of sampling and repeats
+    the rest. This class instead partitions every source into non-overlapping
+    fixed-length instances and traverses a shuffled permutation of them, so a
+    source is fully covered (100%, no repeats) before any instance is seen
+    twice -- matching OLMo's NumpyFSLDataset "concatenate & chunk + global
+    shuffle" behaviour, extended to a weighted multi-source mixture.
+
+    Semantics:
+      * Each source is chunked into instances of length (block_size+1), stride
+        block_size (consecutive instances share one boundary token, nanoGPT
+        style). n_instances(shard) = (len(mm) - 1) // block_size.
+      * A per-source cursor yields instances WITHOUT replacement: shards are
+        visited in a shuffled order and each shard's instances are shuffled;
+        when a source is exhausted it reshuffles and starts a new pass (so a
+        small source cycles through full epochs, a large source may not finish
+        even one pass -- both with zero mid-pass repetition).
+      * Which source to draw from each step is chosen ~ per-source weight, so
+        the training-visible mixture converges to the target ratios while every
+        drawn instance is fresh within the current pass.
+      * DDP/worker safe: instances are disjointly partitioned across every
+        (rank, worker) by a global stride, so no instance is seen by two
+        replicas within the same pass.
+
+    Memory-light: no giant global permutation is materialised; shuffling is
+    done at shard granularity plus a per-shard instance permutation
+    (<= a few MB per shard).
+    """
+    def __init__(self, sources, block_size, seed=1337, rank=0, world=1,
+                 count_sources=False):
+        super().__init__()
+        self.block_size = block_size
+        self.seed = seed
+        self.rank = rank
+        self.world = world
+        self.count_sources = count_sources
+        self._counts = {}
+        self.src_names = []
+        self.src_weights = []
+        self.src_shards = []   # per source: list of memmaps
+        for src_dir, w in sources.items():
+            if w <= 0:
+                continue
+            idx = read_index(src_dir)
+            dtype = np.dtype(idx["dtype"])
+            shards = []
+            for sh in idx["shards"]:
+                p = os.path.join(src_dir, sh["path"])
+                mm = np.memmap(p, dtype=dtype, mode="r")
+                if len(mm) <= block_size + 1:
+                    continue
+                shards.append(mm)
+            if not shards:
+                continue
+            self.src_names.append(os.path.basename(src_dir.rstrip("/")))
+            self.src_weights.append(float(w))
+            self.src_shards.append(shards)
+        if not self.src_shards:
+            raise ValueError("EpochMixtureDataset: no usable sources")
+        sw = np.array(self.src_weights, dtype=np.float64)
+        self.src_weights = sw / sw.sum()
+
+    def source_counts(self):
+        return dict(self._counts)
+
+    def _source_cursor(self, si, rng, global_worker, n_global):
+        """Infinite generator of (shard_memmap, start) for source si, drawn
+        without replacement within each pass, restricted to this (rank,worker)
+        slice via a global stride, reshuffling on each new pass."""
+        shards = self.src_shards[si]
+        bs = self.block_size
+        pass_no = 0
+        while True:
+            # shuffle shard visitation order for this pass
+            shard_order = rng.permutation(len(shards))
+            emitted = 0
+            for shi in shard_order:
+                mm = shards[shi]
+                n_inst = (len(mm) - 1) // bs
+                if n_inst <= 0:
+                    continue
+                # this (rank,worker)'s disjoint slice of instances in this shard
+                local = np.arange(global_worker, n_inst, n_global) \
+                    if global_worker < n_inst else np.empty(0, dtype=np.int64)
+                if local.size == 0:
+                    continue
+                rng.shuffle(local)
+                for k in local:
+                    yield mm, int(k) * bs
+                    emitted += 1
+            pass_no += 1
+            if emitted == 0:
+                # this rank/worker owns no instances of this source; avoid a
+                # tight infinite loop -- yield nothing by breaking to fallback
+                return
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        worker_id = info.id if info else 0
+        num_workers = info.num_workers if info else 1
+        n_global = self.world * num_workers
+        global_worker = self.rank * num_workers + worker_id
+        # source-selection RNG (same across shards); per (rank,worker) stream
+        sel_rng = np.random.default_rng(
+            self.seed + self.rank * 100003 + worker_id * 10007)
+        # each source gets its own permutation RNG stream
+        cursors = [self._source_cursor(
+                       si,
+                       np.random.default_rng(self.seed + 777 * (si + 1)
+                                             + self.rank * 100003
+                                             + worker_id * 10007),
+                       global_worker, n_global)
+                   for si in range(len(self.src_shards))]
+        bs1 = self.block_size + 1
+        n_src = len(self.src_shards)
+        active = list(range(n_src))
+        while active:
+            si = sel_rng.choice(n_src, p=self.src_weights)
+            try:
+                mm, start = next(cursors[si])
+            except StopIteration:
+                # source owns no instances for this replica; drop it & renorm
+                if si in active:
+                    active.remove(si)
+                if not active:
+                    break
+                w = self.src_weights.copy()
+                mask = np.ones(n_src, dtype=bool)
+                mask[[i for i in range(n_src) if i not in active]] = False
+                w = np.where(mask, w, 0.0)
+                self.src_weights = w / w.sum()
+                continue
+            chunk = np.asarray(mm[start:start + bs1]).astype(np.int64)
+            if self.count_sources:
+                name = self.src_names[si]
+                self._counts[name] = self._counts.get(name, 0) + 1
+            x = torch.from_numpy(chunk[:-1])
+            y = torch.from_numpy(chunk[1:])
+            yield x, y
+
+
+
 def prepare_data(dataset_name, out_dir, tokenizer, split="train",
 
                  text_key="text", num_proc=32, val_frac=0.0005,
