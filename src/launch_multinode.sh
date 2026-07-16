@@ -1,23 +1,8 @@
-#!/bin/bash
-# Launcher: run from node-0. Fans out run_multinode.sh to all nodes via
-# `su $TRUST_USER -c "ssh node-N ..."`. Node-0 is master.
-# TRUST_USER = the inter-node SSH trust user. CONDA_ENV = the torch conda env.
-# WORKDIR = shared work dir (code synced to local disk per node in practice).
-set -e
-NODES=(node-0 node-1 node-2 node-3 node-4 node-5 node-6 node-7)
-MASTER_ADDR=$(getent hosts node-0 | awk '{print $1}')
-export MASTER_ADDR
-WORKDIR=${WORKDIR:?set WORKDIR}
-TRUST_USER=${TRUST_USER:?set TRUST_USER}
-CONDA_ENV=${CONDA_ENV:-base}
+#!/usr/bin/env bash
+# Compatibility shim. Multi-node orchestration is implemented by the generic
+# scripts/launch_multinode.sh and configured by tracked files under recipes/.
+set -euo pipefail
 
-for i in "${!NODES[@]}"; do
-  n=${NODES[$i]}
-  echo "launching NODE_RANK=$i on $n (master=$MASTER_ADDR)"
-  su "$TRUST_USER" -c "ssh -o LogLevel=ERROR -o StrictHostKeyChecking=no $n \
-    'cd $WORKDIR/src && source ~/.bashrc && conda activate $CONDA_ENV 2>/dev/null; \
-     NNODES=8 GPUS_PER_NODE=8 NODE_RANK=$i MASTER_ADDR=$MASTER_ADDR MASTER_PORT=29500 \
-     nohup bash run_multinode.sh > $WORKDIR/train_node${i}.log 2>&1 &'" &
-done
-wait
-echo "all nodes launched. tail logs at $WORKDIR/train_node*.log"
+echo "DEPRECATED: do not launch an experiment from src/launch_multinode.sh." >&2
+echo "Run a tracked script under recipes/ instead." >&2
+exit 2
