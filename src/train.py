@@ -385,22 +385,29 @@ def main():
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
-    # TensorBoard writer on master rank only (event files -> shared disk)
+    # Restore before creating SummaryWriter so purge_step can hide stale events
+    # beyond the checkpoint (e.g. when a run stops between checkpoints).
+    model.train()
+    step = 0
+    skipped_steps = 0
+    if resume_path:
+        step = load_ckpt(model, opt, resume_path)
+
+    # TensorBoard writer on master rank only (event files -> shared disk).
+    # On resume, keep history below `step` and purge orphaned events at/after it;
+    # the resumed run then rewrites those global steps cleanly.
     writer = None
     if is_master() and getattr(cfg, "tensorboard", False):
         try:
             from torch.utils.tensorboard import SummaryWriter
             tb_dir = cfg.tb_dir or os.path.join(cfg.out_dir, "tb")
             os.makedirs(tb_dir, exist_ok=True)
-            writer = SummaryWriter(log_dir=tb_dir)
-            log(f"[tb] TensorBoard logging to {tb_dir}")
+            purge_step = step if resume_path else None
+            writer = SummaryWriter(log_dir=tb_dir, purge_step=purge_step)
+            log(f"[tb] TensorBoard logging to {tb_dir}"
+                + (f" (purge_step={purge_step})" if purge_step is not None else ""))
         except Exception as e:
             log(f"[tb] disabled ({e})")
-    model.train()
-    step = 0
-    skipped_steps = 0
-    if resume_path:
-        step = load_ckpt(model, opt, resume_path)
     # Deterministic GC: disable automatic collection and instead run a light
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
