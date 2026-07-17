@@ -9,6 +9,7 @@ import os
 import math
 import json
 import time
+import gc
 import argparse
 from datetime import timedelta
 import torch
@@ -446,7 +447,6 @@ def main():
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
     # (Borrowed from OLMo train.py.) gc_collect_interval steps between collects.
-    import gc
     gc.collect()
     gc.disable()
     gc_interval = getattr(cfg, "gc_collect_interval", 1000)
