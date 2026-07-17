@@ -283,23 +283,32 @@ def main():
     torch.manual_seed(cfg.seed)
 
     if args.tunableop_mode != "off":
-        tunable = torch.cuda.tunable
         filename = args.tunableop_file.format(hostname=os.uname().nodename)
+        if args.tunableop_mode == "record":
+            stem, suffix = os.path.splitext(filename)
+            filename = f"{stem}{local_rank}{suffix}"
         os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+
+        # Inductor may execute GEMM selection in child processes, so configure
+        # both the environment (inherited by children) and the parent API.
+        os.environ["PYTORCH_TUNABLEOP_ENABLED"] = "1"
+        os.environ["PYTORCH_TUNABLEOP_TUNING"] = "0"
+        os.environ["PYTORCH_TUNABLEOP_RECORD_UNTUNED"] = (
+            "1" if args.tunableop_mode == "record" else "0")
+        os.environ["PYTORCH_TUNABLEOP_FILENAME"] = filename
+        tunable = torch.cuda.tunable
         tunable.enable(True)
         tunable.tuning_enable(False)  # never tune synchronously in the training job
+        tunable.set_filename(filename, insert_device_ordinal=False)
         if args.tunableop_mode == "record":
-            tunable.set_filename(filename, insert_device_ordinal=True)
             # The ROCm recorder appends only to an existing CSV; initialize it
             # with validator rows before the first GEMM.
-            if not tunable.write_file(tunable.get_filename()):
-                raise RuntimeError(f"failed to initialize TunableOp CSV: {tunable.get_filename()}")
+            if not tunable.write_file(filename):
+                raise RuntimeError(f"failed to initialize TunableOp CSV: {filename}")
             tunable.record_untuned_enable(True)
             tunable.write_file_on_exit(True)
-        else:
-            tunable.set_filename(filename, insert_device_ordinal=False)
-            if not tunable.read_file(filename):
-                raise RuntimeError(f"failed to load TunableOp results: {filename}")
+        elif not tunable.read_file(filename):
+            raise RuntimeError(f"failed to load TunableOp results: {filename}")
         log(f"[tunableop] mode={args.tunableop_mode} file={tunable.get_filename()}")
 
     # --- resolve resume EARLY so the data loader can fast-forward past already
