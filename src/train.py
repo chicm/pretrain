@@ -139,15 +139,17 @@ def resolve_resume_path(spec, out_dir):
     return os.path.join(out_dir, spec)
 
 
-def load_ckpt(model, opt, path):
-    """Restore model + optimizer from a full-state-dict checkpoint. Returns next step."""
+def load_ckpt(model, opt, path, components="all"):
+    """Restore selected state from a full-state-dict checkpoint. Returns next step."""
     from torch.distributed.checkpoint.state_dict import (
         set_model_state_dict, set_optimizer_state_dict, StateDictOptions)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    set_model_state_dict(model, ckpt["model"], options=opts)
-    set_optimizer_state_dict(model, opt, ckpt["opt"], options=opts)
-    log(f"[ckpt] resumed from {path} at step {ckpt['step']}")
+    if components in ("all", "model"):
+        set_model_state_dict(model, ckpt["model"], options=opts)
+    if components in ("all", "optimizer"):
+        set_optimizer_state_dict(model, opt, ckpt["opt"], options=opts)
+    log(f"[ckpt] resumed components={components} from {path} at step {ckpt['step']}")
     return ckpt["step"] + 1
 
 
@@ -199,6 +201,8 @@ def main():
                          "re-trained.")
     ap.add_argument("--data_skip_steps", type=int, default=None,
                     help=argparse.SUPPRESS)  # diagnostic: isolate data-position effects
+    ap.add_argument("--resume_components", choices=("all", "model", "optimizer"),
+                    default="all", help=argparse.SUPPRESS)  # diagnostic only
     ap.add_argument("--keep_last_ckpts", type=int, default=None,
                     help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
                          "0 = keep all. Prevents disk blow-up over long runs.")
@@ -403,7 +407,7 @@ def main():
     step = 0
     skipped_steps = 0
     if resume_path:
-        step = load_ckpt(model, opt, resume_path)
+        step = load_ckpt(model, opt, resume_path, components=args.resume_components)
     if cfg.compile:
         model = torch.compile(model)
 
