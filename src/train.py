@@ -139,17 +139,21 @@ def resolve_resume_path(spec, out_dir):
     return os.path.join(out_dir, spec)
 
 
-def load_ckpt(model, opt, path, components="all"):
-    """Restore selected state from a full-state-dict checkpoint. Returns next step."""
-    from torch.distributed.checkpoint.state_dict import (
-        set_model_state_dict, set_optimizer_state_dict, StateDictOptions)
+def load_ckpt_model_before_shard(model, path, components="all"):
+    """Load full model state before FSDP2 creates parameter shards."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
     if components in ("all", "model"):
-        set_model_state_dict(model, ckpt["model"], options=opts)
+        model.load_state_dict(ckpt["model"], strict=True)
+    return ckpt
+
+
+def load_ckpt_optimizer_after_shard(model, opt, ckpt, components="all"):
+    """Restore optimizer state after FSDP2 sharding and return the next step."""
     if components in ("all", "optimizer"):
+        from torch.distributed.checkpoint.state_dict import (
+            set_optimizer_state_dict, StateDictOptions)
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         set_optimizer_state_dict(model, opt, ckpt["opt"], options=opts)
-    log(f"[ckpt] resumed components={components} from {path} at step {ckpt['step']}")
     return ckpt["step"] + 1
 
 
@@ -340,6 +344,16 @@ def main():
         else:
             from fp8_utils import convert_model_to_fp8
             convert_model_to_fp8(model, recipe=args.fp8_recipe, log=log)
+
+    # Materialize checkpoint weights before fully_shard. This lets FSDP2 create its
+    # local shards from the restored parameters instead of replacing shard storage
+    # through set_model_state_dict after sharding.
+    resume_ckpt = None
+    if resume_path:
+        resume_ckpt = load_ckpt_model_before_shard(
+            model, resume_path, components=args.resume_components)
+        log(f"[ckpt] loaded model components={args.resume_components} before FSDP2 sharding")
+
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
@@ -398,16 +412,18 @@ def main():
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
-    # Restore into the uncompiled FSDP2 module.  Loading through an OptimizedModule
-    # wrapper can replace/re-layout sharded parameter storage after compile setup;
-    # this is a suspected cause of persistent throughput loss on resumed FP8 runs.
-    # The optimizer must already exist for its state to be restored, while compile
-    # remains lazy and belongs after all model/optimizer state restoration.
+    # Optimizer state requires the sharded model for FQN-to-shard mapping. Model
+    # weights were already restored before fully_shard above.
     model.train()
     step = 0
     skipped_steps = 0
     if resume_path:
-        step = load_ckpt(model, opt, resume_path, components=args.resume_components)
+        step = load_ckpt_optimizer_after_shard(
+            model, opt, resume_ckpt, components=args.resume_components)
+        log(f"[ckpt] resumed components={args.resume_components} from {resume_path} "
+            f"at step {resume_ckpt['step']}")
+        del resume_ckpt
+        gc.collect()
     if cfg.compile:
         model = torch.compile(model)
 
