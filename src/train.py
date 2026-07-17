@@ -227,9 +227,14 @@ def main():
                          "Pass --no-fp8 to disable (falls back to bf16).")
     ap.add_argument("--fp8_recipe", default="tensorwise", choices=["tensorwise", "rowwise"],
                     help="fp8 scaling recipe: tensorwise (fastest ~1.5x) or rowwise (accurate ~1.4x)")
+    ap.add_argument("--fp8_fsdp_all_gather", action=argparse.BooleanOptionalAction, default=False,
+                    help="communicate torchao Float8Linear weights in FP8 during FSDP all-gather "
+                         "(tensorwise recipe only; default off)")
     args = ap.parse_args()
     if args.fsdp_reshard_last_micro and not args.fsdp_sync_last_micro:
         ap.error("--fsdp_reshard_last_micro requires --fsdp_sync_last_micro")
+    if args.fp8_fsdp_all_gather and (not args.fp8 or args.fp8_recipe != "tensorwise"):
+        ap.error("--fp8_fsdp_all_gather requires --fp8 and --fp8_recipe tensorwise")
     if args.fsdp_reshard_after_forward is not None:
         value = args.fsdp_reshard_after_forward.lower()
         if value in ("true", "false"):
@@ -350,7 +355,9 @@ def main():
                 "falling back to bf16 (eager fp8 is ~2x slower).")
         else:
             from fp8_utils import convert_model_to_fp8
-            convert_model_to_fp8(model, recipe=args.fp8_recipe, log=log)
+            convert_model_to_fp8(
+                model, recipe=args.fp8_recipe, log=log,
+                fsdp_float8_all_gather=args.fp8_fsdp_all_gather)
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
