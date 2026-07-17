@@ -192,6 +192,9 @@ def main():
     ap.add_argument("--fsdp_reshard_last_micro", action=argparse.BooleanOptionalAction, default=False,
                     help="FSDP2 accumulation no-reshard: reshard parameters after backward only "
                          "on the final micro-batch (A2; default off)")
+    ap.add_argument("--fsdp_reshard_after_forward", default=None,
+                    help="Override FSDP2 reshard_after_forward with true, false, or a positive "
+                         "integer shard size (default: library behavior)")
     ap.add_argument("--no_save_final", action="store_true",
                     help="skip the final checkpoint save (for short throughput experiments)")
     ap.add_argument("--no_compile", action="store_true")
@@ -227,6 +230,17 @@ def main():
     args = ap.parse_args()
     if args.fsdp_reshard_last_micro and not args.fsdp_sync_last_micro:
         ap.error("--fsdp_reshard_last_micro requires --fsdp_sync_last_micro")
+    if args.fsdp_reshard_after_forward is not None:
+        value = args.fsdp_reshard_after_forward.lower()
+        if value in ("true", "false"):
+            args.fsdp_reshard_after_forward = value == "true"
+        else:
+            try:
+                args.fsdp_reshard_after_forward = int(value)
+            except ValueError:
+                ap.error("--fsdp_reshard_after_forward must be true, false, or a positive integer")
+            if args.fsdp_reshard_after_forward < 1:
+                ap.error("--fsdp_reshard_after_forward integer must be positive")
 
     cfg = TrainConfig()
     for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps", "micro_bsz", "grad_accum"]:
@@ -345,6 +359,9 @@ def main():
     # HSDP: build a 2D device mesh (replicate, shard). shard group stays intra-node so
     # param all-gather is limited to the fast intra-node fabric; cross-node does grad all-reduce.
     fsdp_kw = {}
+    if args.fsdp_reshard_after_forward is not None:
+        fsdp_kw["reshard_after_forward"] = args.fsdp_reshard_after_forward
+        log(f"[fsdp] reshard_after_forward={args.fsdp_reshard_after_forward}")
     hsdp_shard = getattr(args, "hsdp_shard", 0)
     if hsdp_shard and hsdp_shard > 0:
         assert world % hsdp_shard == 0, f"world {world} not divisible by hsdp_shard {hsdp_shard}"
