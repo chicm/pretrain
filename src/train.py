@@ -284,7 +284,10 @@ def main():
 
     if args.tunableop_mode != "off":
         filename = args.tunableop_file.format(hostname=os.uname().nodename)
+        env_filename = filename
         if args.tunableop_mode == "record":
+            # Environment-based TunableOp automatically inserts the device
+            # ordinal. The parent API needs that already-expanded path.
             stem, suffix = os.path.splitext(filename)
             filename = f"{stem}{local_rank}{suffix}"
         os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
@@ -295,7 +298,7 @@ def main():
         os.environ["PYTORCH_TUNABLEOP_TUNING"] = "0"
         os.environ["PYTORCH_TUNABLEOP_RECORD_UNTUNED"] = (
             "1" if args.tunableop_mode == "record" else "0")
-        os.environ["PYTORCH_TUNABLEOP_FILENAME"] = filename
+        os.environ["PYTORCH_TUNABLEOP_FILENAME"] = env_filename
         tunable = torch.cuda.tunable
         tunable.enable(True)
         tunable.tuning_enable(False)  # never tune synchronously in the training job
