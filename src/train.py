@@ -186,6 +186,11 @@ def main():
     ap.add_argument("--max_steps", type=int, default=None)
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
+    ap.add_argument("--fsdp_sync_last_micro", action=argparse.BooleanOptionalAction, default=False,
+                    help="FSDP2 gradient-accumulation no-sync: reduce-scatter gradients only on "
+                         "the final micro-batch (A1 throughput experiment; default off)")
+    ap.add_argument("--no_save_final", action="store_true",
+                    help="skip the final checkpoint save (for short throughput experiments)")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--activation_checkpoint", action="store_true",
                     help="enable per-Block non-reentrant activation checkpointing (full recompute)")
@@ -379,6 +384,11 @@ def main():
     for layer in model.layers:
         fully_shard(layer, mp_policy=mp, **fsdp_kw)
     fully_shard(model, mp_policy=mp, **fsdp_kw)
+    # Keep the actual FSDP2 root when torch.compile later wraps `model` in an
+    # OptimizedModule. Runtime communication controls belong on this root.
+    fsdp_model = model
+    if args.fsdp_sync_last_micro:
+        log("[fsdp] gradient sync only on final accumulation micro-batch (A1)")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             betas=(cfg.beta1, cfg.beta2),
@@ -433,6 +443,11 @@ def main():
         opt.zero_grad(set_to_none=True)
         loss_mean = 0.0   # accumulates already-divided losses -> equals the mean
         for micro in range(cfg.grad_accum):
+            if args.fsdp_sync_last_micro:
+                # Accumulate full gradients locally for early micros and issue
+                # FSDP2 reduce-scatter only once, on the final micro-batch.
+                fsdp_model.set_requires_gradient_sync(
+                    micro == cfg.grad_accum - 1, recurse=True)
             try:
                 x, y = next(data_iter)
             except StopIteration:
@@ -490,7 +505,10 @@ def main():
         if step % gc_interval == 0:
             gc.collect(1)   # light gen-1 collect, synchronized across all ranks
 
-    save_ckpt(model, opt, step, cfg)
+    if args.no_save_final:
+        log(f"[ckpt] final save skipped at step {step} (--no_save_final)")
+    else:
+        save_ckpt(model, opt, step, cfg)
     if writer is not None:
         writer.close()
     log("[done] training complete")
