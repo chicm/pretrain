@@ -197,6 +197,10 @@ def main():
                          "integer shard size (default: library behavior)")
     ap.add_argument("--no_save_final", action="store_true",
                     help="skip the final checkpoint save (for short throughput experiments)")
+    ap.add_argument("--tunableop_mode", choices=["off", "record", "load"], default="off",
+                    help="PyTorch ROCm TunableOp mode: record untuned GEMMs or load offline results")
+    ap.add_argument("--tunableop_file", default=None,
+                    help="TunableOp CSV path; {hostname} is expanded per node in record mode")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--activation_checkpoint", action="store_true",
                     help="enable per-Block non-reentrant activation checkpointing (full recompute)")
@@ -235,6 +239,8 @@ def main():
         ap.error("--fsdp_reshard_last_micro requires --fsdp_sync_last_micro")
     if args.fp8_fsdp_all_gather and (not args.fp8 or args.fp8_recipe != "tensorwise"):
         ap.error("--fp8_fsdp_all_gather requires --fp8 and --fp8_recipe tensorwise")
+    if args.tunableop_mode != "off" and not args.tunableop_file:
+        ap.error("--tunableop_file is required when --tunableop_mode is record or load")
     if args.fsdp_reshard_after_forward is not None:
         value = args.fsdp_reshard_after_forward.lower()
         if value in ("true", "false"):
@@ -275,6 +281,22 @@ def main():
     local_rank = setup_dist()
     world = dist.get_world_size()
     torch.manual_seed(cfg.seed)
+
+    if args.tunableop_mode != "off":
+        tunable = torch.cuda.tunable
+        filename = args.tunableop_file.format(hostname=os.uname().nodename)
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+        tunable.enable(True)
+        tunable.tuning_enable(False)  # never tune synchronously in the training job
+        if args.tunableop_mode == "record":
+            tunable.set_filename(filename, insert_device_ordinal=True)
+            tunable.record_untuned_enable(True)
+            tunable.write_file_on_exit(True)
+        else:
+            tunable.set_filename(filename, insert_device_ordinal=False)
+            if not tunable.read_file(filename):
+                raise RuntimeError(f"failed to load TunableOp results: {filename}")
+        log(f"[tunableop] mode={args.tunableop_mode} file={tunable.get_filename()}")
 
     # --- resolve resume EARLY so the data loader can fast-forward past already
     # consumed instances (avoids re-training on the same data after a restart) ---
