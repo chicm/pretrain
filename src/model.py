@@ -44,6 +44,7 @@ class ModelArgs:
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True
+    use_flash_attn: bool = False    # optional flash-attn 3 training kernel
     # --- Gemma-inspired extras ---
     qk_norm: bool = True         # RMSNorm on per-head Q/K (default on)
     sliding_window: int = 0      # local window size; 0 = no sliding (all full)
@@ -112,6 +113,7 @@ class Attention(nn.Module):
         self.rep = self.n_heads // self.n_kv_heads
         self.layer_type = layer_type
         self.sliding_window = args.sliding_window
+        self.use_flash_attn = args.use_flash_attn
         self.wq = nn.Linear(args.dim, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -132,15 +134,23 @@ class Attention(nn.Module):
             k = self.k_norm(k)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        if self.rep > 1:
-            k = k.repeat_interleave(self.rep, dim=1)
-            v = v.repeat_interleave(self.rep, dim=1)
-        if self.layer_type == "sliding" and self.sliding_window > 0:
-            # local causal window: token t attends to (t-window, t].
-            attn_mask = _sliding_causal_mask(T, self.sliding_window, x.device)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        if self.use_flash_attn and self.layer_type == "full":
+            # flash-attn uses (batch, sequence, heads, head_dim) and supports
+            # native GQA, avoiding the explicit KV repeat used by SDPA.
+            from flash_attn import flash_attn_func
+            out = flash_attn_func(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True
+            ).transpose(1, 2)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if self.rep > 1:
+                k = k.repeat_interleave(self.rep, dim=1)
+                v = v.repeat_interleave(self.rep, dim=1)
+            if self.layer_type == "sliding" and self.sliding_window > 0:
+                # local causal window: token t attends to (t-window, t].
+                attn_mask = _sliding_causal_mask(T, self.sliding_window, x.device)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 

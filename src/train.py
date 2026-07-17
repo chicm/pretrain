@@ -217,6 +217,8 @@ def main():
                          "0 = keep all. Prevents disk blow-up over long runs.")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
+    ap.add_argument("--flash_attn", action=argparse.BooleanOptionalAction, default=False,
+                    help="use flash-attn 3 for full causal attention (native GQA; default off)")
     ap.add_argument("--hsdp_shard", type=int, default=0,
                     help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
                          "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
@@ -328,6 +330,7 @@ def main():
 
     # --- data ---
     margs = MODELS[cfg.model]()
+    margs.use_flash_attn = args.flash_attn
     cfg.block_size = margs.max_seq_len
     if getattr(args, "data_mix", None):
         # multi-source weighted sampling (1T corpus)
