@@ -1,7 +1,7 @@
 # Chimera-8B 1T 预训练吞吐优化计划（MI300X / FSDP2）
 
 **日期**：2026-07  
-**状态**：调研与实验计划；尚未应用到正在运行的正式任务  
+**状态**：实验已完成；最优方案 A1+A2 已应用到正式 1T 训练  
 **适用范围**：Chimera-8B（7.602B dense）、PyTorch FSDP2、64×MI300X、FP8 Linear、sequence length 4096
 
 > 本文目标是在**不改变模型架构、数据配比、全局 batch 和学习率计划**的前提下，利用当前富余 HBM，减少 FSDP2 通信和参数重建开销，并进一步优化 MI300X 上的 GEMM/Attention kernel。所有改动必须先经过短程 A/B，再从已有 checkpoint 恢复正式训练；禁止直接在运行中的 1T 任务上试验。
@@ -582,14 +582,58 @@ speedup = candidate_throughput / baseline_throughput - 1
 
 ---
 
-## 18. 当前结论
+## 18. 实验结果与最终结论
 
-当前最明确的机会不是继续加 batch，而是：
+本轮 64×MI300X 短程 A/B 已全部完成。所有吞吐结果均排除首步编译和 warmup，以约 **600K tok/s** 作为统一历史基线；每个候选项使用独立输出目录，不从 checkpoint 恢复，避免 resume 特有吞吐回退污染比较。
 
-1. **gradient accumulation 前三个 micro-batch 不做 FSDP2 gradient synchronization**；
-2. **利用富余 HBM，在 accumulation 和 forward/backward 之间减少 reshard/all-gather**；
-3. **启用并验证 FP8 parameter all-gather**；
-4. **对固定 FP8/BF16 GEMM shape 做离线 tuning**；
-5. 最后再由 profiler 指导 AITER/Primus-Turbo kernel 替换。
+### 18.1 A 组：FSDP2 通信与 reshard
 
-其中第 1 项是代码中最明确、风险最低且最应优先验证的优化点。所有候选项均需在 checkpoint 边界进行短程 A/B，达到性能、数值和可恢复性门槛后才进入正式 1T 训练。
+| 实验 | 改动 | 稳态吞吐 | 相对 600K | HBM / GPU | 结论 |
+|---|---|---:|---:|---:|---|
+| A0 | 原始配置 | 600K | — | — | 历史基线 |
+| A1 | 仅最后一个 micro 同步梯度 | 623.25K | +3.88% | 106.6GB | 有效 |
+| **A2** | A1 + 仅最后一个 micro 执行 backward reshard | **637.15K** | **+6.19%** | 106.5GB | **最终 winner** |
+| A3 | A2 + `reshard_after_forward=8` | — | — | 约 200GB | OOM/RCCL Accept failure/double-free，拒绝 |
+| A3-False | A2 + `reshard_after_forward=False` | 未运行 | — | 预计高于 A3 | A3 已超显存，故跳过 |
+
+A1+A2 对应正式参数：
+
+```bash
+--fsdp_sync_last_micro \
+--fsdp_reshard_last_micro
+```
+
+它只减少 gradient accumulation 中前三个 microbatch 的冗余同步和重分片，不改变 global batch、优化器、LR、数据顺序或 FP8 recipe。
+
+### 18.2 B 组：FP8 通信与 GEMM
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| B0：A1+A2 | 637.15K tok/s | B 组新基线 |
+| B1：FP8 parameter all-gather | 约 574K tok/s，HBM 约 112GB | 相对原始基线也回退，拒绝 |
+| B2：TunableOp / GEMM tuning | 独立 GEMM 可写 tuning 记录；完整模型在首个算子内停滞 20–25+ 分钟，结果文件无有效 GEMM 条目 | 当前 PyTorch 2.8 / ROCm 6.4.3 栈不可用 |
+| B3：FP8 all-gather + tuning | 未组合 | 两个单项均无可用收益，不再组合 |
+| B4：BF16 gradient reduce | 640.4K tok/s；相对 A2 仅 +0.51% | 低于验收阈值且存在轻微数值漂移，不上线 |
+
+因此正式训练继续使用 **FP32 gradient reduce**，不启用 `--reduce_bf16` 或 `--fp8_fsdp_all_gather`。
+
+### 18.3 C 组：kernel 与编译模式
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| FlashAttention 3 causal GQA backend | 启动后 20+ 分钟仍未到 step 0 | 当前栈不可用，拒绝 |
+| AITER FlashAttention / fused kernel | AITER JIT 构建后出现 `module_aiter_enum` 导入错误 | C1–C4 被环境阻塞；无可验证 winner |
+| fused RMSNorm / RoPE / SwiGLU | 未单独替换 | 现有表达式已由 `torch.compile` 融合，且 AITER 后端不可用 |
+| kernel 组合 | 未执行 | 没有通过单项验收的组件 |
+| `torch.compile(mode="max-autotune")` | step 0 触发 103 个 `AUTOTUNE scaled_mm(...)`，10+ 分钟无法前进 | 不适合当前训练栈，拒绝 |
+
+### 18.4 最终生产配置
+
+唯一达到**收益明显、数值健康、显存安全、工程可用**四项要求的方案是 **A1+A2**：
+
+- fresh-run 稳态吞吐：**600K → 637K tok/s（+6.2%）**；
+- 每卡 HBM：约 **106.5GB / 192GB**；
+- 不启用 BF16 reduce、FP8 all-gather、FlashAttention、TunableOp 或 max-autotune；
+- 已通过提交 `8d65e712c4c758cd3cffb9661bee31f5a69492f5` 写入 `recipes/chimera_8b_1t.sh`，并部署到正式 1T 训练。
+
+正式任务从 `ckpt_14000.pt` 恢复后实测约 **587–589K tok/s**。该数字受此前已经确认的 checkpoint-resume 吞吐回退影响，不能与 fresh-run A/B 的 637K 直接比较；恢复后的 loss、gradient norm、64 卡利用率和 HBM 均正常。resume 回退作为独立问题继续跟踪，不影响 A1+A2 是本轮相对实验 winner 的结论。
