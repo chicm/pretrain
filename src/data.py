@@ -146,6 +146,11 @@ class WeightedMultiSourceDataset(IterableDataset):
             mm = shards[shi]
             start = int(rng.integers(0, len(mm) - bs1))
             chunk = np.asarray(mm[start:start + bs1]).astype(np.int64)
+            # Defensive: an index whose ntok overstates the real memmap length
+            # (e.g. a shard whose tokenization was interrupted mid-write) yields
+            # a short/empty tail slice -> collate stack size mismatch. Skip it.
+            if chunk.shape[0] != bs1:
+                continue
             if self.count_sources:
                 name = self.src_names[si]
                 self._counts[name] = self._counts.get(name, 0) + 1
@@ -329,6 +334,11 @@ class EpochMixtureDataset(IterableDataset):
                 produced += 1
                 continue
             chunk = np.asarray(mm[start:start + bs1]).astype(np.int64)
+            # Defensive: an index whose ntok overstates the real memmap length
+            # (e.g. a shard whose tokenization was interrupted mid-write) yields
+            # a short/empty tail slice -> collate stack size mismatch. Skip it.
+            if chunk.shape[0] != bs1:
+                continue
             if self.count_sources:
                 name = self.src_names[si]
                 self._counts[name] = self._counts.get(name, 0) + 1

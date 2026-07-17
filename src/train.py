@@ -29,6 +29,18 @@ from data import PackedDataset
 from configs import MODELS, TrainConfig
 
 
+def _stack_collate(batch):
+    """Stack (x, y) samples with torch.stack, bypassing torch's default
+    collate_tensor_fn shared-memory 'out=' path (elem.new(storage).resize_),
+    which raises 'Trying to resize storage that is not resizable' on int64
+    tensors derived from numpy memmaps under multi-worker DataLoaders on this
+    ROCm build. torch.stack allocates a fresh contiguous output -> safe."""
+    xs = torch.stack([b[0] for b in batch], 0)
+    ys = torch.stack([b[1] for b in batch], 0)
+    return xs, ys
+
+
+
 def is_master():
     return int(os.environ.get("RANK", 0)) == 0
 
@@ -167,10 +179,31 @@ def main():
                     help="named mix (mix_1t/smoke) or inline JSON of source->weight; "
                          "enables multi-source weighted sampling (overrides --data_dir)")
     ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--tb_dir", default=None,
+                    help="TensorBoard log dir override (default <out_dir>/tb).")
+    ap.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None,
+                    help="enable/disable TensorBoard event writing (default from TrainConfig).")
     ap.add_argument("--max_steps", type=int, default=None)
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
+    ap.add_argument("--fsdp_sync_last_micro", action=argparse.BooleanOptionalAction, default=False,
+                    help="FSDP2 gradient-accumulation no-sync: reduce-scatter gradients only on "
+                         "the final micro-batch (A1 throughput experiment; default off)")
+    ap.add_argument("--fsdp_reshard_last_micro", action=argparse.BooleanOptionalAction, default=False,
+                    help="FSDP2 accumulation no-reshard: reshard parameters after backward only "
+                         "on the final micro-batch (A2; default off)")
+    ap.add_argument("--fsdp_reshard_after_forward", default=None,
+                    help="Override FSDP2 reshard_after_forward with true, false, or a positive "
+                         "integer shard size (default: library behavior)")
+    ap.add_argument("--no_save_final", action="store_true",
+                    help="skip the final checkpoint save (for short throughput experiments)")
+    ap.add_argument("--tunableop_mode", choices=["off", "record", "load"], default="off",
+                    help="PyTorch ROCm TunableOp mode: record untuned GEMMs or load offline results")
+    ap.add_argument("--tunableop_file", default=None,
+                    help="TunableOp CSV path; {hostname} is expanded per node in record mode")
     ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--compile_mode", choices=("default", "max-autotune"), default="default",
+                    help="torch.compile mode (default: default)")
     ap.add_argument("--activation_checkpoint", action="store_true",
                     help="enable per-Block non-reentrant activation checkpointing (full recompute)")
     ap.add_argument("--selective_ac", action="store_true",
@@ -186,6 +219,8 @@ def main():
                          "0 = keep all. Prevents disk blow-up over long runs.")
     ap.add_argument("--reduce_bf16", action="store_true",
                     help="use bf16 gradient reduce_dtype (default fp32); speed A/B, watch grad_norm")
+    ap.add_argument("--flash_attn", action=argparse.BooleanOptionalAction, default=False,
+                    help="use flash-attn 3 for full causal attention (native GQA; default off)")
     ap.add_argument("--hsdp_shard", type=int, default=0,
                     help="if >0, use HSDP 2D mesh: shard group size = this (e.g. 8 = intra-node), "
                          "replicate group = world/shard. 0 = full FSDP2 sharding (default)")
@@ -200,10 +235,30 @@ def main():
                          "Pass --no-fp8 to disable (falls back to bf16).")
     ap.add_argument("--fp8_recipe", default="tensorwise", choices=["tensorwise", "rowwise"],
                     help="fp8 scaling recipe: tensorwise (fastest ~1.5x) or rowwise (accurate ~1.4x)")
+    ap.add_argument("--fp8_fsdp_all_gather", action=argparse.BooleanOptionalAction, default=False,
+                    help="communicate torchao Float8Linear weights in FP8 during FSDP all-gather "
+                         "(tensorwise recipe only; default off)")
     args = ap.parse_args()
+    if args.fsdp_reshard_last_micro and not args.fsdp_sync_last_micro:
+        ap.error("--fsdp_reshard_last_micro requires --fsdp_sync_last_micro")
+    if args.fp8_fsdp_all_gather and (not args.fp8 or args.fp8_recipe != "tensorwise"):
+        ap.error("--fp8_fsdp_all_gather requires --fp8 and --fp8_recipe tensorwise")
+    if args.tunableop_mode != "off" and not args.tunableop_file:
+        ap.error("--tunableop_file is required when --tunableop_mode is record or load")
+    if args.fsdp_reshard_after_forward is not None:
+        value = args.fsdp_reshard_after_forward.lower()
+        if value in ("true", "false"):
+            args.fsdp_reshard_after_forward = value == "true"
+        else:
+            try:
+                args.fsdp_reshard_after_forward = int(value)
+            except ValueError:
+                ap.error("--fsdp_reshard_after_forward must be true, false, or a positive integer")
+            if args.fsdp_reshard_after_forward < 1:
+                ap.error("--fsdp_reshard_after_forward integer must be positive")
 
     cfg = TrainConfig()
-    for k in ["model", "data_dir", "out_dir", "max_steps", "micro_bsz", "grad_accum"]:
+    for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps", "micro_bsz", "grad_accum"]:
         v = getattr(args, k)
         if v is not None:
             setattr(cfg, k, v)
@@ -231,6 +286,38 @@ def main():
     world = dist.get_world_size()
     torch.manual_seed(cfg.seed)
 
+    if args.tunableop_mode != "off":
+        filename = args.tunableop_file.format(hostname=os.uname().nodename)
+        env_filename = filename
+        if args.tunableop_mode == "record":
+            # Environment-based TunableOp automatically inserts the device
+            # ordinal. The parent API needs that already-expanded path.
+            stem, suffix = os.path.splitext(filename)
+            filename = f"{stem}{local_rank}{suffix}"
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+
+        # Inductor may execute GEMM selection in child processes, so configure
+        # both the environment (inherited by children) and the parent API.
+        os.environ["PYTORCH_TUNABLEOP_ENABLED"] = "1"
+        os.environ["PYTORCH_TUNABLEOP_TUNING"] = "0"
+        os.environ["PYTORCH_TUNABLEOP_RECORD_UNTUNED"] = (
+            "1" if args.tunableop_mode == "record" else "0")
+        os.environ["PYTORCH_TUNABLEOP_FILENAME"] = env_filename
+        tunable = torch.cuda.tunable
+        tunable.enable(True)
+        tunable.tuning_enable(False)  # never tune synchronously in the training job
+        tunable.set_filename(filename, insert_device_ordinal=False)
+        if args.tunableop_mode == "record":
+            # The ROCm recorder appends only to an existing CSV; initialize it
+            # with validator rows before the first GEMM.
+            if not tunable.write_file(filename):
+                raise RuntimeError(f"failed to initialize TunableOp CSV: {filename}")
+            tunable.record_untuned_enable(True)
+            tunable.write_file_on_exit(True)
+        elif not tunable.read_file(filename):
+            raise RuntimeError(f"failed to load TunableOp results: {filename}")
+        log(f"[tunableop] mode={args.tunableop_mode} file={tunable.get_filename()}")
+
     # --- resolve resume EARLY so the data loader can fast-forward past already
     # consumed instances (avoids re-training on the same data after a restart) ---
     resume_path = resolve_resume_path(args.resume, cfg.out_dir)
@@ -245,6 +332,7 @@ def main():
 
     # --- data ---
     margs = MODELS[cfg.model]()
+    margs.use_flash_attn = args.flash_attn
     cfg.block_size = margs.max_seq_len
     if getattr(args, "data_mix", None):
         # multi-source weighted sampling (1T corpus)
@@ -260,7 +348,8 @@ def main():
             sources, cfg.block_size, seed=cfg.seed,
             rank=dist.get_rank(), world=world, resume_skip=resume_skip)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
-                            num_workers=4, pin_memory=True, drop_last=True)
+                            num_workers=4, pin_memory=True, drop_last=True,
+                            collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
             log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
@@ -275,7 +364,8 @@ def main():
         sampler = DistributedSampler(train_ds, num_replicas=world,
                                      rank=dist.get_rank(), shuffle=True)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz, sampler=sampler,
-                            num_workers=4, pin_memory=True, drop_last=True)
+                            num_workers=4, pin_memory=True, drop_last=True,
+                            collate_fn=_stack_collate)
 
         # optional val set (written by prepare_data when val_frac > 0)
         val_loader = None
@@ -283,7 +373,8 @@ def main():
         if os.path.exists(val_path):
             val_ds = PackedDataset(val_path, cfg.block_size, meta["dtype"])
             val_loader = DataLoader(val_ds, batch_size=cfg.micro_bsz, shuffle=False,
-                                    num_workers=2, pin_memory=True, drop_last=True)
+                                    num_workers=2, pin_memory=True, drop_last=True,
+                                    collate_fn=_stack_collate)
 
     # --- model + FSDP2 ---
     model = Transformer(margs).to("cuda")
@@ -307,7 +398,9 @@ def main():
                 "falling back to bf16 (eager fp8 is ~2x slower).")
         else:
             from fp8_utils import convert_model_to_fp8
-            convert_model_to_fp8(model, recipe=args.fp8_recipe, log=log)
+            convert_model_to_fp8(
+                model, recipe=args.fp8_recipe, log=log,
+                fsdp_float8_all_gather=args.fp8_fsdp_all_gather)
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
@@ -316,6 +409,9 @@ def main():
     # HSDP: build a 2D device mesh (replicate, shard). shard group stays intra-node so
     # param all-gather is limited to the fast intra-node fabric; cross-node does grad all-reduce.
     fsdp_kw = {}
+    if args.fsdp_reshard_after_forward is not None:
+        fsdp_kw["reshard_after_forward"] = args.fsdp_reshard_after_forward
+        log(f"[fsdp] reshard_after_forward={args.fsdp_reshard_after_forward}")
     hsdp_shard = getattr(args, "hsdp_shard", 0)
     if hsdp_shard and hsdp_shard > 0:
         assert world % hsdp_shard == 0, f"world {world} not divisible by hsdp_shard {hsdp_shard}"
@@ -360,30 +456,47 @@ def main():
     for layer in model.layers:
         fully_shard(layer, mp_policy=mp, **fsdp_kw)
     fully_shard(model, mp_policy=mp, **fsdp_kw)
-    if cfg.compile:
-        model = torch.compile(model)
+    # Keep the actual FSDP2 root when torch.compile later wraps `model` in an
+    # OptimizedModule. Runtime communication controls belong on this root.
+    fsdp_model = model
+    if args.fsdp_sync_last_micro:
+        log("[fsdp] gradient sync only on final accumulation micro-batch (A1)")
+    if args.fsdp_reshard_last_micro:
+        log("[fsdp] backward reshard only on final accumulation micro-batch (A2)")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             betas=(cfg.beta1, cfg.beta2),
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
-    # TensorBoard writer on master rank only (event files -> shared disk)
+    # Restore into the uncompiled FSDP2 module.  Loading through an OptimizedModule
+    # wrapper can replace/re-layout sharded parameter storage after compile setup;
+    # this is a suspected cause of persistent throughput loss on resumed FP8 runs.
+    # The optimizer must already exist for its state to be restored, while compile
+    # remains lazy and belongs after all model/optimizer state restoration.
+    model.train()
+    step = 0
+    skipped_steps = 0
+    if resume_path:
+        step = load_ckpt(model, opt, resume_path)
+    if cfg.compile:
+        model = torch.compile(model, mode=args.compile_mode)
+
+    # TensorBoard writer on master rank only (event files -> shared disk).
+    # On resume, keep history below `step` and purge orphaned events at/after it;
+    # the resumed run then rewrites those global steps cleanly.
     writer = None
     if is_master() and getattr(cfg, "tensorboard", False):
         try:
             from torch.utils.tensorboard import SummaryWriter
             tb_dir = cfg.tb_dir or os.path.join(cfg.out_dir, "tb")
             os.makedirs(tb_dir, exist_ok=True)
-            writer = SummaryWriter(log_dir=tb_dir)
-            log(f"[tb] TensorBoard logging to {tb_dir}")
+            purge_step = step if resume_path else None
+            writer = SummaryWriter(log_dir=tb_dir, purge_step=purge_step)
+            log(f"[tb] TensorBoard logging to {tb_dir}"
+                + (f" (purge_step={purge_step})" if purge_step is not None else ""))
         except Exception as e:
             log(f"[tb] disabled ({e})")
-    model.train()
-    step = 0
-    skipped_steps = 0
-    if resume_path:
-        step = load_ckpt(model, opt, resume_path)
     # Deterministic GC: disable automatic collection and instead run a light
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
@@ -404,6 +517,15 @@ def main():
         opt.zero_grad(set_to_none=True)
         loss_mean = 0.0   # accumulates already-divided losses -> equals the mean
         for micro in range(cfg.grad_accum):
+            is_last_micro = micro == cfg.grad_accum - 1
+            if args.fsdp_sync_last_micro:
+                # Accumulate full gradients locally for early micros and issue
+                # FSDP2 reduce-scatter only once, on the final micro-batch.
+                fsdp_model.set_requires_gradient_sync(is_last_micro, recurse=True)
+            if args.fsdp_reshard_last_micro:
+                # Keep parameters unsharded across early accumulation micros;
+                # restore normal post-backward reshard on the final micro.
+                fsdp_model.set_reshard_after_backward(is_last_micro, recurse=True)
             try:
                 x, y = next(data_iter)
             except StopIteration:
@@ -461,7 +583,10 @@ def main():
         if step % gc_interval == 0:
             gc.collect(1)   # light gen-1 collect, synchronized across all ranks
 
-    save_ckpt(model, opt, step, cfg)
+    if args.no_save_final:
+        log(f"[ckpt] final save skipped at step {step} (--no_save_final)")
+    else:
+        save_ckpt(model, opt, step, cfg)
     if writer is not None:
         writer.close()
     log("[done] training complete")

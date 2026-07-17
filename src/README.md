@@ -14,8 +14,8 @@
 | `eval.py` | 用 lm-eval-harness 评测 checkpoint（loglikelihood 任务，base 模型无需指令微调） |
 | `download_data.sh` | 下载 TinyStories + FineWeb-10BT 到数据目录 |
 | `run_smoke.sh` | 单节点冒烟测试：tiny 模型 + TinyStories |
-| `run_multinode.sh` | 单节点执行脚本（多机训练，需 NODE_RANK/MASTER_ADDR） |
-| `launch_multinode.sh` | 从 node-0 分发到各节点启动多机训练 |
+| `run_multinode.sh` | 已弃用的兼容入口；正式训练使用仓库根目录 `recipes/` |
+| `launch_multinode.sh` | 已弃用的兼容入口；通用编排在仓库根目录 `scripts/` |
 | `run_eval.sh` | 单 GPU 跑 eval.py 的封装（自动装 lm-eval） |
 
 ## 路径约定
@@ -43,12 +43,12 @@ bash download_data.sh
 # 2. 冒烟测试（单节点，tiny 模型 + TinyStories）
 bash run_smoke.sh
 
-# 3. 1B 多机训练（多节点 + FineWeb-10BT）
-#    先 tokenize：
-python tokenize_data.py --dataset HuggingFaceFW/fineweb --hf_config sample-10BT \
-    --split train --out "$WORKDIR/data/fineweb_tok"
-#    再从 node-0 启动：
-bash launch_multinode.sh
+# 3. 多机训练
+#    数据准备完成后，从仓库根目录运行一个 Git-tracked recipe。
+#    recipe 记录实际路径、拓扑、源码 revision 和完整训练参数：
+cd ..
+bash recipes/chimera_8b_1t.sh
+cd src
 
 # 4. 评测 checkpoint（base 模型用 log-likelihood，无需指令微调）
 bash run_eval.sh "$WORKDIR/checkpoints/fineweb_1b_chimera/ckpt_2000.pt"

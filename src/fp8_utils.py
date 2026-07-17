@@ -25,18 +25,23 @@ def _is_mi300():
         return "MI300" in name
 
 
-def convert_model_to_fp8(model, recipe: str = "tensorwise", log=print):
+def convert_model_to_fp8(model, recipe: str = "tensorwise", log=print,
+                         fsdp_float8_all_gather: bool = False):
     """In-place convert eligible nn.Linear layers to torchao Float8Linear.
 
     recipe: 'tensorwise' (fastest on MI300X) or 'rowwise' (more accurate, ~1.4x).
+    fsdp_float8_all_gather: communicate converted weights in FP8 during FSDP all-gather.
     Returns the (mutated) model. Requires torch.compile downstream to be fast.
     """
     from torchao.float8 import convert_to_float8_training, Float8LinearConfig
     from torchao.float8.config import Float8LinearRecipeName
 
     if recipe == "tensorwise":
-        cfg = Float8LinearConfig()
+        cfg = Float8LinearConfig(
+            enable_fsdp_float8_all_gather=fsdp_float8_all_gather)
     elif recipe == "rowwise":
+        if fsdp_float8_all_gather:
+            raise ValueError("FSDP FP8 all-gather requires tensorwise FP8 scaling")
         cfg = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.ROWWISE)
     else:
         raise ValueError(f"unknown fp8 recipe: {recipe!r}")
@@ -60,7 +65,8 @@ def convert_model_to_fp8(model, recipe: str = "tensorwise", log=print):
     n_fp8 = sum(isinstance(m, Float8Linear) for m in model.modules())
     mi = _is_mi300()
     log(f"[fp8] recipe={recipe} converted {n_fp8}/{n_before} Linear layers "
-        f"(is_MI300={mi}; dtype={'fnuz' if mi else 'ocp-e4m3fn'}). "
+        f"(is_MI300={mi}; dtype={'fnuz' if mi else 'ocp-e4m3fn'}; "
+        f"fsdp_float8_all_gather={fsdp_float8_all_gather}). "
         f"torch.compile REQUIRED for speedup.")
     if not mi:
         log("[fp8] WARNING: not detected as MI300 -> fp8 gemm may be unsupported/slow.")
