@@ -197,6 +197,8 @@ def main():
                          "a bare filename (ckpt_5000.pt), or an explicit path. Restores "
                          "model+opt+step and fast-forwards the data stream so no data is "
                          "re-trained.")
+    ap.add_argument("--data_skip_steps", type=int, default=None,
+                    help=argparse.SUPPRESS)  # diagnostic: isolate data-position effects
     ap.add_argument("--keep_last_ckpts", type=int, default=None,
                     help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
                          "0 = keep all. Prevents disk blow-up over long runs.")
@@ -257,7 +259,14 @@ def main():
         del _meta
     # instances THIS replica consumed before the resume point
     per_step_replica = cfg.micro_bsz * cfg.grad_accum
-    resume_skip = resume_step * per_step_replica
+    data_step = resume_step
+    if args.data_skip_steps is not None:
+        if resume_path:
+            raise ValueError("--data_skip_steps cannot be combined with --resume")
+        if args.data_skip_steps < 0:
+            raise ValueError("--data_skip_steps must be non-negative")
+        data_step = args.data_skip_steps
+    resume_skip = data_step * per_step_replica
 
     # --- data ---
     margs = MODELS[cfg.model]()
@@ -280,8 +289,8 @@ def main():
                             collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
-            log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
-                f"(step {resume_step})")
+            log(f"[data] fast-forwarding {resume_skip} instances/replica "
+                f"(data step {data_step})")
         log(f"[data] multi-source mix '{args.data_mix}': "
             + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
     else:
