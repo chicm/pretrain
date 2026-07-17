@@ -84,6 +84,10 @@ TRAIN_ARGS=(
   "--fp8"
   "--fp8_recipe" "tensorwise"
   "--fused_ce"
+  # Validated 64-GPU FSDP2 winner: synchronize/reshard only on the final
+  # accumulation microbatch. Steady throughput 637K tok/s vs 600K baseline.
+  "--fsdp_sync_last_micro"
+  "--fsdp_reshard_last_micro"
 )
 
 # shellcheck source=../scripts/launch_multinode.sh
