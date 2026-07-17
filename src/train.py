@@ -208,6 +208,8 @@ def main():
                     help=argparse.SUPPRESS)  # diagnostic: isolate data-position effects
     ap.add_argument("--resume_components", choices=("all", "model", "optimizer"),
                     default="all", help=argparse.SUPPRESS)  # diagnostic only
+    ap.add_argument("--reinit_lm_head_after_resume", action="store_true",
+                    help=argparse.SUPPRESS)  # diagnostic only
     ap.add_argument("--keep_last_ckpts", type=int, default=None,
                     help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
                          "0 = keep all. Prevents disk blow-up over long runs.")
@@ -354,6 +356,9 @@ def main():
         resume_ckpt = load_ckpt_model_before_shard(
             model, resume_path, components=args.resume_components)
         log(f"[ckpt] loaded model components={args.resume_components} before FSDP2 sharding")
+        if args.reinit_lm_head_after_resume:
+            torch.nn.init.normal_(model.lm_head.weight, mean=0.0, std=0.02)
+            log("[diag] reinitialized lm_head after checkpoint restore")
 
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
