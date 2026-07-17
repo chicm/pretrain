@@ -9,7 +9,6 @@ import os
 import math
 import json
 import time
-import gc
 import argparse
 from datetime import timedelta
 import torch
@@ -140,21 +139,15 @@ def resolve_resume_path(spec, out_dir):
     return os.path.join(out_dir, spec)
 
 
-def load_ckpt_model_before_shard(model, path, components="all"):
-    """Load full model state before FSDP2 creates parameter shards."""
+def load_ckpt(model, opt, path):
+    """Restore model + optimizer from a full-state-dict checkpoint. Returns next step."""
+    from torch.distributed.checkpoint.state_dict import (
+        set_model_state_dict, set_optimizer_state_dict, StateDictOptions)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if components in ("all", "model"):
-        model.load_state_dict(ckpt["model"], strict=True)
-    return ckpt
-
-
-def load_ckpt_optimizer_after_shard(model, opt, ckpt, components="all"):
-    """Restore optimizer state after FSDP2 sharding and return the next step."""
-    if components in ("all", "optimizer"):
-        from torch.distributed.checkpoint.state_dict import (
-            set_optimizer_state_dict, StateDictOptions)
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        set_optimizer_state_dict(model, opt, ckpt["opt"], options=opts)
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    set_model_state_dict(model, ckpt["model"], options=opts)
+    set_optimizer_state_dict(model, opt, ckpt["opt"], options=opts)
+    log(f"[ckpt] resumed from {path} at step {ckpt['step']}")
     return ckpt["step"] + 1
 
 
@@ -204,12 +197,6 @@ def main():
                          "a bare filename (ckpt_5000.pt), or an explicit path. Restores "
                          "model+opt+step and fast-forwards the data stream so no data is "
                          "re-trained.")
-    ap.add_argument("--data_skip_steps", type=int, default=None,
-                    help=argparse.SUPPRESS)  # diagnostic: isolate data-position effects
-    ap.add_argument("--resume_components", choices=("all", "model", "optimizer"),
-                    default="all", help=argparse.SUPPRESS)  # diagnostic only
-    ap.add_argument("--reinit_lm_head_after_resume", action="store_true",
-                    help=argparse.SUPPRESS)  # diagnostic only
     ap.add_argument("--keep_last_ckpts", type=int, default=None,
                     help="keep only the N most recent ckpt_*.pt on disk (default cfg=3). "
                          "0 = keep all. Prevents disk blow-up over long runs.")
@@ -270,14 +257,7 @@ def main():
         del _meta
     # instances THIS replica consumed before the resume point
     per_step_replica = cfg.micro_bsz * cfg.grad_accum
-    data_step = resume_step
-    if args.data_skip_steps is not None:
-        if resume_path:
-            raise ValueError("--data_skip_steps cannot be combined with --resume")
-        if args.data_skip_steps < 0:
-            raise ValueError("--data_skip_steps must be non-negative")
-        data_step = args.data_skip_steps
-    resume_skip = data_step * per_step_replica
+    resume_skip = resume_step * per_step_replica
 
     # --- data ---
     margs = MODELS[cfg.model]()
@@ -300,8 +280,8 @@ def main():
                             collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
-            log(f"[data] fast-forwarding {resume_skip} instances/replica "
-                f"(data step {data_step})")
+            log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
+                f"(step {resume_step})")
         log(f"[data] multi-source mix '{args.data_mix}': "
             + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
     else:
@@ -347,19 +327,6 @@ def main():
         else:
             from fp8_utils import convert_model_to_fp8
             convert_model_to_fp8(model, recipe=args.fp8_recipe, log=log)
-
-    # Materialize checkpoint weights before fully_shard. This lets FSDP2 create its
-    # local shards from the restored parameters instead of replacing shard storage
-    # through set_model_state_dict after sharding.
-    resume_ckpt = None
-    if resume_path:
-        resume_ckpt = load_ckpt_model_before_shard(
-            model, resume_path, components=args.resume_components)
-        log(f"[ckpt] loaded model components={args.resume_components} before FSDP2 sharding")
-        if args.reinit_lm_head_after_resume:
-            torch.nn.init.normal_(model.lm_head.weight, mean=0.0, std=0.02)
-            log("[diag] reinitialized lm_head after checkpoint restore")
-
     log(f"[model] {cfg.model}: {model.num_params()/1e9:.3f}B params, "
         f"vocab={margs.vocab_size}, world={world}")
     reduce_dtype = torch.bfloat16 if getattr(args, "reduce_bf16", False) else torch.float32
@@ -418,18 +385,16 @@ def main():
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
-    # Optimizer state requires the sharded model for FQN-to-shard mapping. Model
-    # weights were already restored before fully_shard above.
+    # Restore into the uncompiled FSDP2 module.  Loading through an OptimizedModule
+    # wrapper can replace/re-layout sharded parameter storage after compile setup;
+    # this is a suspected cause of persistent throughput loss on resumed FP8 runs.
+    # The optimizer must already exist for its state to be restored, while compile
+    # remains lazy and belongs after all model/optimizer state restoration.
     model.train()
     step = 0
     skipped_steps = 0
     if resume_path:
-        step = load_ckpt_optimizer_after_shard(
-            model, opt, resume_ckpt, components=args.resume_components)
-        log(f"[ckpt] resumed components={args.resume_components} from {resume_path} "
-            f"at step {resume_ckpt['step']}")
-        del resume_ckpt
-        gc.collect()
+        step = load_ckpt(model, opt, resume_path)
     if cfg.compile:
         model = torch.compile(model)
 
@@ -452,6 +417,7 @@ def main():
     # gen-1 collect on ALL ranks at the same step. Prevents random full-GC on
     # one rank from stalling the whole world at the next all-gather (straggler).
     # (Borrowed from OLMo train.py.) gc_collect_interval steps between collects.
+    import gc
     gc.collect()
     gc.disable()
     gc_interval = getattr(cfg, "gc_collect_interval", 1000)
