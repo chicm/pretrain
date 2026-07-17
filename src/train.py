@@ -181,6 +181,8 @@ def main():
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--tb_dir", default=None,
                     help="TensorBoard log dir override (default <out_dir>/tb).")
+    ap.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None,
+                    help="enable/disable TensorBoard event writing (default from TrainConfig).")
     ap.add_argument("--max_steps", type=int, default=None)
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
@@ -217,7 +219,7 @@ def main():
     args = ap.parse_args()
 
     cfg = TrainConfig()
-    for k in ["model", "data_dir", "out_dir", "tb_dir", "max_steps", "micro_bsz", "grad_accum"]:
+    for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps", "micro_bsz", "grad_accum"]:
         v = getattr(args, k)
         if v is not None:
             setattr(cfg, k, v)
