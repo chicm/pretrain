@@ -379,21 +379,24 @@ def main():
     for layer in model.layers:
         fully_shard(layer, mp_policy=mp, **fsdp_kw)
     fully_shard(model, mp_policy=mp, **fsdp_kw)
-    if cfg.compile:
-        model = torch.compile(model)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             betas=(cfg.beta1, cfg.beta2),
                             weight_decay=cfg.weight_decay, fused=True)
 
     # --- train loop ---
-    # Restore before creating SummaryWriter so purge_step can hide stale events
-    # beyond the checkpoint (e.g. when a run stops between checkpoints).
+    # Restore into the uncompiled FSDP2 module.  Loading through an OptimizedModule
+    # wrapper can replace/re-layout sharded parameter storage after compile setup;
+    # this is a suspected cause of persistent throughput loss on resumed FP8 runs.
+    # The optimizer must already exist for its state to be restored, while compile
+    # remains lazy and belongs after all model/optimizer state restoration.
     model.train()
     step = 0
     skipped_steps = 0
     if resume_path:
         step = load_ckpt(model, opt, resume_path)
+    if cfg.compile:
+        model = torch.compile(model)
 
     # TensorBoard writer on master rank only (event files -> shared disk).
     # On resume, keep history below `step` and purge orphaned events at/after it;
