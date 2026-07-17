@@ -202,6 +202,8 @@ def main():
     ap.add_argument("--tunableop_file", default=None,
                     help="TunableOp CSV path; {hostname} is expanded per node in record mode")
     ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--compile_mode", choices=("default", "max-autotune"), default="default",
+                    help="torch.compile mode (default: default)")
     ap.add_argument("--activation_checkpoint", action="store_true",
                     help="enable per-Block non-reentrant activation checkpointing (full recompute)")
     ap.add_argument("--selective_ac", action="store_true",
@@ -478,7 +480,7 @@ def main():
     if resume_path:
         step = load_ckpt(model, opt, resume_path)
     if cfg.compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode=args.compile_mode)
 
     # TensorBoard writer on master rank only (event files -> shared disk).
     # On resume, keep history below `step` and purge orphaned events at/after it;
