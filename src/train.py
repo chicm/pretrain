@@ -189,6 +189,9 @@ def main():
     ap.add_argument("--fsdp_sync_last_micro", action=argparse.BooleanOptionalAction, default=False,
                     help="FSDP2 gradient-accumulation no-sync: reduce-scatter gradients only on "
                          "the final micro-batch (A1 throughput experiment; default off)")
+    ap.add_argument("--fsdp_reshard_last_micro", action=argparse.BooleanOptionalAction, default=False,
+                    help="FSDP2 accumulation no-reshard: reshard parameters after backward only "
+                         "on the final micro-batch (A2; default off)")
     ap.add_argument("--no_save_final", action="store_true",
                     help="skip the final checkpoint save (for short throughput experiments)")
     ap.add_argument("--no_compile", action="store_true")
@@ -222,6 +225,8 @@ def main():
     ap.add_argument("--fp8_recipe", default="tensorwise", choices=["tensorwise", "rowwise"],
                     help="fp8 scaling recipe: tensorwise (fastest ~1.5x) or rowwise (accurate ~1.4x)")
     args = ap.parse_args()
+    if args.fsdp_reshard_last_micro and not args.fsdp_sync_last_micro:
+        ap.error("--fsdp_reshard_last_micro requires --fsdp_sync_last_micro")
 
     cfg = TrainConfig()
     for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps", "micro_bsz", "grad_accum"]:
@@ -389,6 +394,8 @@ def main():
     fsdp_model = model
     if args.fsdp_sync_last_micro:
         log("[fsdp] gradient sync only on final accumulation micro-batch (A1)")
+    if args.fsdp_reshard_last_micro:
+        log("[fsdp] backward reshard only on final accumulation micro-batch (A2)")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             betas=(cfg.beta1, cfg.beta2),
@@ -443,11 +450,15 @@ def main():
         opt.zero_grad(set_to_none=True)
         loss_mean = 0.0   # accumulates already-divided losses -> equals the mean
         for micro in range(cfg.grad_accum):
+            is_last_micro = micro == cfg.grad_accum - 1
             if args.fsdp_sync_last_micro:
                 # Accumulate full gradients locally for early micros and issue
                 # FSDP2 reduce-scatter only once, on the final micro-batch.
-                fsdp_model.set_requires_gradient_sync(
-                    micro == cfg.grad_accum - 1, recurse=True)
+                fsdp_model.set_requires_gradient_sync(is_last_micro, recurse=True)
+            if args.fsdp_reshard_last_micro:
+                # Keep parameters unsharded across early accumulation micros;
+                # restore normal post-backward reshard on the final micro.
+                fsdp_model.set_reshard_after_backward(is_last_micro, recurse=True)
             try:
                 x, y = next(data_iter)
             except StopIteration:
