@@ -39,7 +39,11 @@ _write_launch_manifest() {
     fi
     echo "repo_url=$REPO_URL"
     echo "local_repo=$LOCAL_REPO"
-    echo "conda_env=$CONDA_ENV"
+    if [[ -n ${VENV_DIR:-} ]]; then
+      echo "venv_dir=$VENV_DIR"
+    else
+      echo "conda_env=$CONDA_ENV"
+    fi
     echo "nnodes=${#NODES[@]}"
     echo "nodes=${NODES[*]}"
     echo "log_dir=$LOGDIR"
@@ -90,8 +94,12 @@ _build_remote_command() {
   cmd+=" if [[ \"\$actual_rev\" != $(_shell_quote "$CODE_REV") ]]; then"
   cmd+=" echo \"ERROR: code revision mismatch: expected $CODE_REV, got \$actual_rev\" >&2; exit 3; fi;"
   cmd+=" cd $(_shell_quote "$LOCAL_REPO/src");"
-  cmd+=" source $(_shell_quote "$CONDA_SH");"
-  cmd+=" conda activate $(_shell_quote "$CONDA_ENV");"
+  if [[ -n ${VENV_DIR:-} ]]; then
+    cmd+=" export PATH=$(_shell_quote "$VENV_DIR/bin"):\$PATH;"
+  else
+    cmd+=" source $(_shell_quote "$CONDA_SH");"
+    cmd+=" conda activate $(_shell_quote "$CONDA_ENV");"
+  fi
 
   for item in "${REMOTE_ENV[@]}"; do
     key=${item%%=*}
@@ -121,8 +129,12 @@ launch_multinode() {
   _require_scalar REPO_URL
   _require_scalar CODE_REV
   _require_scalar LOCAL_REPO
-  _require_scalar CONDA_SH
-  _require_scalar CONDA_ENV
+  if [[ -n ${VENV_DIR:-} ]]; then
+    _require_scalar VENV_DIR
+  else
+    _require_scalar CONDA_SH
+    _require_scalar CONDA_ENV
+  fi
   _require_scalar LOGDIR
   _require_scalar OUT
 

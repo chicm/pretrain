@@ -27,6 +27,7 @@ from model import Transformer
 from model import Block as TransformerBlock
 from data import PackedDataset
 from configs import MODELS, TrainConfig
+from training_progress import cosine_lr, resume_skip_for_rank, tokens_before_step
 
 
 def _stack_collate(batch):
@@ -62,7 +63,17 @@ def setup_dist():
     return local_rank
 
 
-def lr_at(step, cfg):
+def lr_at(step, cfg, consumed_tokens=None):
+    if cfg.lr_schedule_total_tokens > 0:
+        if consumed_tokens is None:
+            raise ValueError("consumed_tokens is required for token-based LR scheduling")
+        return cosine_lr(
+            consumed_tokens,
+            cfg.lr_warmup_tokens,
+            cfg.lr_schedule_total_tokens,
+            cfg.lr,
+            cfg.min_lr,
+        )
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
     if step >= cfg.max_steps:
@@ -72,7 +83,7 @@ def lr_at(step, cfg):
     return cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
 
 
-def save_ckpt(model, opt, step, cfg):
+def save_ckpt(model, opt, step, cfg, consumed_tokens=None):
     os.makedirs(cfg.out_dir, exist_ok=True)
     # gather full state dicts — COLLECTIVE: all ranks must participate
     from torch.distributed.checkpoint.state_dict import (
@@ -85,6 +96,7 @@ def save_ckpt(model, opt, step, cfg):
     path = os.path.join(cfg.out_dir, f"ckpt_{step}.pt")
     tmp = path + ".tmp"
     torch.save({"model": model_sd, "opt": opt_sd, "step": step,
+                "consumed_tokens": consumed_tokens,
                 "cfg": cfg.__dict__}, tmp)
     os.replace(tmp, path)   # atomic: a crash mid-write never leaves a half ckpt
     # write/refresh the "latest" pointer so --resume latest just works
@@ -184,6 +196,12 @@ def main():
     ap.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None,
                     help="enable/disable TensorBoard event writing (default from TrainConfig).")
     ap.add_argument("--max_steps", type=int, default=None)
+    ap.add_argument("--lr_warmup_tokens", type=int, default=None,
+                    help="warmup length in tokens; enables token-based LR with --lr_schedule_total_tokens")
+    ap.add_argument("--lr_schedule_total_tokens", type=int, default=None,
+                    help="total cosine schedule length in tokens (world-size independent)")
+    ap.add_argument("--resume_consumed_tokens", type=int, default=None,
+                    help="global tokens consumed before the first resumed step; used for elastic data/LR progress")
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
     ap.add_argument("--fsdp_sync_last_micro", action=argparse.BooleanOptionalAction, default=False,
@@ -258,7 +276,8 @@ def main():
                 ap.error("--fsdp_reshard_after_forward integer must be positive")
 
     cfg = TrainConfig()
-    for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps", "micro_bsz", "grad_accum"]:
+    for k in ["model", "data_dir", "out_dir", "tb_dir", "tensorboard", "max_steps",
+              "lr_warmup_tokens", "lr_schedule_total_tokens", "micro_bsz", "grad_accum"]:
         v = getattr(args, k)
         if v is not None:
             setattr(cfg, k, v)
@@ -281,6 +300,16 @@ def main():
     }
     for k, v in _MODEL_OPT.get(cfg.model, {}).items():
         setattr(cfg, k, v)
+
+    token_lr_fields = (cfg.lr_warmup_tokens > 0, cfg.lr_schedule_total_tokens > 0)
+    if token_lr_fields[0] != token_lr_fields[1]:
+        ap.error("--lr_warmup_tokens and --lr_schedule_total_tokens must be set together")
+    if cfg.lr_schedule_total_tokens and cfg.lr_schedule_total_tokens <= cfg.lr_warmup_tokens:
+        ap.error("--lr_schedule_total_tokens must exceed --lr_warmup_tokens")
+
+    margs = MODELS[cfg.model]()
+    margs.use_flash_attn = args.flash_attn
+    cfg.block_size = margs.max_seq_len
 
     local_rank = setup_dist()
     world = dist.get_world_size()
@@ -322,18 +351,33 @@ def main():
     # consumed instances (avoids re-training on the same data after a restart) ---
     resume_path = resolve_resume_path(args.resume, cfg.out_dir)
     resume_step = 0
+    checkpoint_consumed_tokens = None
     if resume_path:
         _meta = torch.load(resume_path, map_location="cpu", weights_only=False)
         resume_step = int(_meta["step"]) + 1   # next step to run
+        checkpoint_consumed_tokens = _meta.get("consumed_tokens")
         del _meta
-    # instances THIS replica consumed before the resume point
-    per_step_replica = cfg.micro_bsz * cfg.grad_accum
-    resume_skip = resume_step * per_step_replica
+        gc.collect()
+    tokens_per_step = cfg.micro_bsz * cfg.block_size * cfg.grad_accum * world
+    explicit_resume_tokens = (checkpoint_consumed_tokens
+                              if checkpoint_consumed_tokens is not None
+                              else args.resume_consumed_tokens)
+    if explicit_resume_tokens is not None:
+        if not resume_path:
+            ap.error("--resume_consumed_tokens requires --resume")
+        resume_consumed_tokens = int(explicit_resume_tokens)
+        try:
+            resume_skip = resume_skip_for_rank(
+                resume_consumed_tokens, cfg.block_size, world, dist.get_rank())
+        except ValueError as exc:
+            ap.error(str(exc))
+    else:
+        # Legacy same-world-size behavior.
+        per_step_replica = cfg.micro_bsz * cfg.grad_accum
+        resume_skip = resume_step * per_step_replica
+        resume_consumed_tokens = resume_step * tokens_per_step
 
     # --- data ---
-    margs = MODELS[cfg.model]()
-    margs.use_flash_attn = args.flash_attn
-    cfg.block_size = margs.max_seq_len
     if getattr(args, "data_mix", None):
         # multi-source weighted sampling (1T corpus)
         from data import EpochMixtureDataset, read_index
@@ -352,8 +396,8 @@ def main():
                             collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
-            log(f"[data] resume: fast-forwarding {resume_skip} instances/replica "
-                f"(step {resume_step})")
+            log(f"[data] resume: fast-forwarding {resume_skip} instances on rank 0 "
+                f"(step={resume_step}, consumed_tokens={resume_consumed_tokens}, world={world})")
         log(f"[data] multi-source mix '{args.data_mix}': "
             + ", ".join(f"{os.path.basename(k)}={v}" for k, v in sources.items()))
     else:
@@ -507,11 +551,15 @@ def main():
     gc_interval = getattr(cfg, "gc_collect_interval", 1000)
     log(f"[gc] automatic GC disabled; manual gc.collect(1) every {gc_interval} steps")
     t0 = time.time()
-    tokens_per_step = cfg.micro_bsz * cfg.grad_accum * world * cfg.block_size
+    if cfg.lr_schedule_total_tokens > 0:
+        log(f"[lr] token schedule: consumed={resume_consumed_tokens} "
+            f"warmup={cfg.lr_warmup_tokens} total={cfg.lr_schedule_total_tokens}")
     data_iter = iter(loader)
     epoch = 0
     while step < cfg.max_steps:
-        lr = lr_at(step, cfg)
+        consumed_before = tokens_before_step(
+            step, resume_step, resume_consumed_tokens, tokens_per_step)
+        lr = lr_at(step, cfg, consumed_tokens=consumed_before)
         for g in opt.param_groups:
             g["lr"] = lr
         opt.zero_grad(set_to_none=True)
@@ -567,7 +615,7 @@ def main():
                 writer.add_scalar("train/lr", lr, step)
                 writer.add_scalar("perf/tokens_per_sec", tps, step)
                 writer.add_scalar("perf/mem_gb", mem, step)
-                writer.add_scalar("progress/tokens", step * tokens_per_step, step)
+                writer.add_scalar("progress/tokens", consumed_before + tokens_per_step, step)
             torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
         if cfg.eval_every > 0 and step > 0 and step % cfg.eval_every == 0:
@@ -578,7 +626,7 @@ def main():
                     writer.add_scalar("val/loss", val_loss, step)
             t0 = time.time()   # don't count eval time in tok/s
         if step > 0 and step % cfg.ckpt_every == 0:
-            save_ckpt(model, opt, step, cfg)
+            save_ckpt(model, opt, step, cfg, consumed_before + tokens_per_step)
         step += 1
         if step % gc_interval == 0:
             gc.collect(1)   # light gen-1 collect, synchronized across all ranks
@@ -586,7 +634,9 @@ def main():
     if args.no_save_final:
         log(f"[ckpt] final save skipped at step {step} (--no_save_final)")
     else:
-        save_ckpt(model, opt, step, cfg)
+        final_consumed = tokens_before_step(
+            step, resume_step, resume_consumed_tokens, tokens_per_step)
+        save_ckpt(model, opt, step, cfg, final_consumed)
     if writer is not None:
         writer.close()
     log("[done] training complete")

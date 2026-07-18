@@ -29,21 +29,23 @@ LOCAL_REPO="/scratch/code"
 CODE_REV=$(git -C "$LOCAL_REPO" rev-parse HEAD)
 CODE_SYNC_MODE="verify"          # deploy the same revision to every node first
 
-# Exact 8-node MI300X topology.
-NODES=(node-0 node-1 node-2 node-3 node-4 node-5 node-6 node-7)
+# Migrated 15-node MI300X topology (120 GPUs).
+NODES=(node-{0..14})
 
-# Exact runtime environment.
-CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-CONDA_ENV="py_3.10"
+# ROCm 7.1 image runtime environment.
+VENV_DIR="/opt/venv"
 HF_HOME="/scratch/hf_local"
 
 # Exact shared storage layout.
 SHARED="/scratch/AzureBlobStorage_CODE/scratch/workspaceblobstore/chec/pretrain"
 DATA="$SHARED/data/tinystories_tok"
 DATA_ROOT="$SHARED/data"
-OUT="$SHARED/checkpoints/chimera_1t"
-LOGDIR="$SHARED/logs"
-TB_DIR="/scratch/azureml/cr/j/9c09a3062dda4b66a76667ef14ead331/exe/wd"
+OUT="${OUT_OVERRIDE:-$SHARED/checkpoints/chimera_1t}"
+LOGDIR="${LOGDIR_OVERRIDE:-$SHARED/logs}"
+TB_DIR="${TB_DIR_OVERRIDE:-/scratch/azureml/cr/j/454bfccaf2e34030b93119d8f6a55b99/exe/wd}"
+MAX_STEPS="${MAX_STEPS_OVERRIDE:-252667}"
+RESUME_FROM="${RESUME_OVERRIDE:-latest}"
+RDZV_ID="${RDZV_ID_OVERRIDE:-chimera1t}"
 
 # Exact environment exported on every worker node.
 REMOTE_ENV=(
@@ -57,9 +59,9 @@ REMOTE_ENV=(
 
 # Exact torchrun rendezvous configuration.
 TORCHRUN_COMMON_ARGS=(
-  "--nnodes=8"
+  "--nnodes=${#NODES[@]}"
   "--nproc_per_node=8"
-  "--rdzv_id=chimera1t"
+  "--rdzv_id=$RDZV_ID"
   "--rdzv_backend=c10d"
   "--rdzv_endpoint=node-0:29500"
   "--rdzv_conf=timeout=900"
@@ -74,11 +76,16 @@ TRAIN_ARGS=(
   "--data_dir" "$DATA"
   "--out_dir" "$OUT"
   "--micro_bsz" "4"
-  "--grad_accum" "4"
-  "--max_steps" "238000"
+  "--grad_accum" "2"
+  "--max_steps" "$MAX_STEPS"
+  "--lr_warmup_tokens" "6291456000"
+  "--lr_schedule_total_tokens" "998244352000"
+  # ckpt_18000 predates consumed-token checkpoint metadata. New checkpoints
+  # persist it and take precedence over this one-time migration fallback.
+  "--resume_consumed_tokens" "75501666304"
   "--data_mix" "mix_1t"
   "--data_root" "$DATA_ROOT"
-  "--resume" "latest"
+  "--resume" "$RESUME_FROM"
   "--keep_last_ckpts" "3"
   "--tb_dir" "$TB_DIR"
   "--fp8"
@@ -89,6 +96,9 @@ TRAIN_ARGS=(
   "--fsdp_sync_last_micro"
   "--fsdp_reshard_last_micro"
 )
+if [[ ${NO_SAVE_FINAL_OVERRIDE:-0} == 1 ]]; then
+  TRAIN_ARGS+=("--no_save_final")
+fi
 
 # shellcheck source=../scripts/launch_multinode.sh
 source "/scratch/code/scripts/launch_multinode.sh"

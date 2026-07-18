@@ -40,6 +40,10 @@ class TrainConfig:
     grad_accum: int = 8          # -> global batch = micro*accum*world_size*block
     max_steps: int = 20000
     warmup_steps: int = 200
+    # When positive, schedule LR by cumulative tokens instead of optimizer steps.
+    # This keeps the LR curve continuous when world size/global batch changes.
+    lr_warmup_tokens: int = 0
+    lr_schedule_total_tokens: int = 0
     lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
