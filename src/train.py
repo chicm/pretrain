@@ -207,6 +207,8 @@ def main():
                     help="global tokens consumed before the first resumed step; used for elastic data/LR progress")
     ap.add_argument("--micro_bsz", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
+    ap.add_argument("--data_workers", type=int, default=4,
+                    help="DataLoader workers per rank; use 0 on runtimes where fork-after-ROCm deadlocks")
     ap.add_argument("--fsdp_sync_last_micro", action=argparse.BooleanOptionalAction, default=False,
                     help="FSDP2 gradient-accumulation no-sync: reduce-scatter gradients only on "
                          "the final micro-batch (A1 throughput experiment; default off)")
@@ -395,7 +397,7 @@ def main():
             sources, cfg.block_size, seed=cfg.seed,
             rank=dist.get_rank(), world=world, resume_skip=resume_skip)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz,
-                            num_workers=4, pin_memory=True, drop_last=True,
+                            num_workers=args.data_workers, pin_memory=True, drop_last=True,
                             collate_fn=_stack_collate)
         val_loader = None
         if resume_skip:
@@ -411,7 +413,7 @@ def main():
         sampler = DistributedSampler(train_ds, num_replicas=world,
                                      rank=dist.get_rank(), shuffle=True)
         loader = DataLoader(train_ds, batch_size=cfg.micro_bsz, sampler=sampler,
-                            num_workers=4, pin_memory=True, drop_last=True,
+                            num_workers=args.data_workers, pin_memory=True, drop_last=True,
                             collate_fn=_stack_collate)
 
         # optional val set (written by prepare_data when val_frac > 0)
@@ -420,7 +422,7 @@ def main():
         if os.path.exists(val_path):
             val_ds = PackedDataset(val_path, cfg.block_size, meta["dtype"])
             val_loader = DataLoader(val_ds, batch_size=cfg.micro_bsz, shuffle=False,
-                                    num_workers=2, pin_memory=True, drop_last=True,
+                                    num_workers=args.data_workers, pin_memory=True, drop_last=True,
                                     collate_fn=_stack_collate)
 
     # --- model + FSDP2 ---

@@ -77,6 +77,9 @@ TRAIN_ARGS=(
   "--out_dir" "$OUT"
   "--micro_bsz" "4"
   "--grad_accum" "2"
+  # ROCm 7.1 can deadlock when DataLoader workers fork after NCCL/FSDP init.
+  # Token blocks are memory-mapped; synchronous loading is cheap relative to a step.
+  "--data_workers" "0"
   "--max_steps" "$MAX_STEPS"
   "--lr_warmup_tokens" "6291456000"
   "--lr_schedule_total_tokens" "998244352000"
