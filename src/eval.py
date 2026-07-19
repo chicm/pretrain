@@ -311,9 +311,20 @@ def main():
                     help="override few-shot (default: task default; MMLU=5)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--output_dir", default=None,
-                    help="write results json here (default: <ckpt_dir>/eval)")
+                    help="LEGACY: write a single results json here. Prefer --eval_root/--run_id.")
     ap.add_argument("--output_suffix", default="",
-                    help="suffix appended to result json filename (avoid overwrite)")
+                    help="LEGACY: suffix appended to result json filename (avoid overwrite)")
+    ap.add_argument("--eval_root", default=None,
+                    help="root dir for structured eval layout (e.g. $S/eval). "
+                         "Results go to <eval_root>/<run_id>/ckpt_<step:08d>/.")
+    ap.add_argument("--run_id", default=None,
+                    help="training run id, e.g. chimera_1t. Required for structured layout.")
+    ap.add_argument("--consumed_tokens", type=int, default=None,
+                    help="consumed tokens at this checkpoint (recorded in config.json/summary.csv)")
+    ap.add_argument("--code_git_sha", default=None,
+                    help="code revision producing this ckpt (recorded in config.json)")
+    ap.add_argument("--step", type=int, default=None,
+                    help="override step number (default: read from checkpoint metadata)")
     ap.add_argument("--confirm_run_unsafe_code", action="store_true",
                     help="allow executing model-generated code (HumanEval/MBPP need this)")
     args = ap.parse_args()
@@ -330,6 +341,8 @@ def main():
 
     # model
     model, margs, cfg, step = load_checkpoint(args.ckpt, args.device)
+    if args.step is not None:
+        step = args.step
 
     # lm-eval
     try:
@@ -363,17 +376,79 @@ def main():
         print(f"  {task:24s} {line}")
     print("=========================================")
 
-    out_dir = args.output_dir or os.path.join(
-        os.path.dirname(os.path.abspath(args.ckpt)), "eval")
-    os.makedirs(out_dir, exist_ok=True)
-    ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
-    out_path = os.path.join(out_dir, f"eval_{ckpt_name}{args.output_suffix}.json")
-    with open(out_path, "w") as f:
-        json.dump({"ckpt": args.ckpt, "step": step, "tasks": tasks,
-                   "results": table, "config": {"model": cfg.get("model"),
-                   "num_fewshot": args.num_fewshot, "limit": args.limit}},
-                  f, indent=2)
-    print(f"[eval] wrote {out_path}")
+    import datetime
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        import lm_eval as _lmev
+        lm_eval_version = getattr(_lmev, "__version__", "unknown")
+    except Exception:
+        lm_eval_version = "unknown"
+
+    if args.eval_root and args.run_id:
+        # ---- structured layout: <eval_root>/<run_id>/ckpt_<step:08d>/ ----
+        try:
+            step_int = int(step)
+        except (TypeError, ValueError):
+            raise SystemExit("[eval] structured layout requires an integer step; "
+                             "pass --step explicitly when ckpt lacks step metadata")
+        run_dir = os.path.join(args.eval_root, args.run_id)
+        step_dir = os.path.join(run_dir, f"ckpt_{step_int:08d}")
+        os.makedirs(step_dir, exist_ok=True)
+
+        results_path = os.path.join(step_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump({"results": table,
+                       "configs": res.get("configs", {}),
+                       "versions": res.get("versions", {})}, f, indent=2)
+
+        config = {
+            "run_id": args.run_id,
+            "step": step_int,
+            "consumed_tokens": args.consumed_tokens,
+            "ckpt": os.path.abspath(args.ckpt),
+            "tasks": tasks,
+            "batch_size": args.batch_size,
+            "num_fewshot": args.num_fewshot,
+            "limit": args.limit,
+            "model": cfg.get("model"),
+            "tokenizer": args.tokenizer,
+            "lm_eval_version": lm_eval_version,
+            "code_git_sha": args.code_git_sha,
+            "device": args.device,
+            "date_utc": now,
+        }
+        with open(os.path.join(step_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # ---- append long-format summary.csv (never rewritten) ----
+        summary_path = os.path.join(run_dir, "summary.csv")
+        header = "step,consumed_tokens,task,metric,value,date_utc\n"
+        need_header = not os.path.exists(summary_path)
+        ct = "" if args.consumed_tokens is None else args.consumed_tokens
+        with open(summary_path, "a") as f:
+            if need_header:
+                f.write(header)
+            for task, metrics in table.items():
+                for k, v in metrics.items():
+                    metric = k.split(",")[0].strip()
+                    if (isinstance(v, (int, float)) and metric not in ("alias", "sample_len")
+                            and not metric.endswith("_stderr")):
+                        f.write(f"{step_int},{ct},{task},{metric},{v},{now}\n")
+        print(f"[eval] wrote {results_path}")
+        print(f"[eval] appended {summary_path}")
+    else:
+        # ---- legacy single-file layout ----
+        out_dir = args.output_dir or os.path.join(
+            os.path.dirname(os.path.abspath(args.ckpt)), "eval")
+        os.makedirs(out_dir, exist_ok=True)
+        ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
+        out_path = os.path.join(out_dir, f"eval_{ckpt_name}{args.output_suffix}.json")
+        with open(out_path, "w") as f:
+            json.dump({"ckpt": args.ckpt, "step": step, "tasks": tasks,
+                       "results": table, "config": {"model": cfg.get("model"),
+                       "num_fewshot": args.num_fewshot, "limit": args.limit}},
+                      f, indent=2)
+        print(f"[eval] wrote {out_path}")
 
 
 if __name__ == "__main__":
